@@ -33,6 +33,7 @@ protocol re-frames them as *me* / *opp* so bots never care which side they are.
 | [competition/protocol.py](competition/protocol.py) | Engine-side stdio wire format. |
 | [competition/matchup.py](competition/matchup.py) | Local match runner driving two subprocess bots. |
 | [competition/agents/](competition/agents/) | Starter bots (`expander_python`, `expander_cpp`, `expander_rust`). |
+| [tools/localmatch.py](tools/localmatch.py) | **Ours.** Competition-faithful local driver — routes through `env.step` so the modifiers apply, and times replies against the 150 ms budget. |
 | [tests/](tests/) | 43 tests. Heaviest coverage on the two modifiers. |
 
 ## The engine
@@ -278,8 +279,20 @@ The project needs its own venv — the ambient shell python has no jax.
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 SDL_VIDEODRIVER=dummy .venv/bin/python -m pytest tests -q     # 43 tests, ~12s
-.venv/bin/python competition/matchup.py --mode competition    # ~3s for a 1200-turn match
+
+# Validate a competition agent with THIS, not matchup.py (see Traps):
+.venv/bin/python tools/localmatch.py A/run.sh B/run.sh --games 10 --swap
 ```
+
+[tools/localmatch.py](tools/localmatch.py) speaks the identical wire protocol to the identical
+`run.sh` subprocesses, but steps through `env.step` under `mode="competition"` so both
+modifiers apply, samples rectangular board dims per seed, times every reply against the 150 ms
+budget, and counts faults. `--swap` alternates seats to halve seat bias; `--gui` replays the
+last game. Startup is ~15 s (JIT + pool), then ~5 s per game.
+
+It imports `competition/protocol.py` read-only rather than vendoring a copy, so the frame
+format can't drift — but writes nothing under `competition/`, which stays exactly as upstream
+ships it.
 
 `SDL_VIDEODRIVER=dummy` keeps pygame from opening a display; CI
 ([.github/workflows/ci.yml](.github/workflows/ci.yml)) sets it globally and runs `pytest -q` on

@@ -176,3 +176,7 @@ competition/agents/*/target/
 # local research artifacts
 figures/
 uv.lock
+
+.claude/settings.local.json
+competition/agents/ppo_bot/weights.npz
+*.pkl

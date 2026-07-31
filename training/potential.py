@@ -201,7 +201,7 @@ def draw_score(state, p):
 # turtling the agent found on its own.
 
 WIN = 10.0
-LOSS = -6.0
+LOSS = -9.0
 DRAW = -2.0
 DRAW_TIEBREAK = 1.0     # a draw while ahead on income hurts less than one behind
 

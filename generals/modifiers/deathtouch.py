@@ -5,18 +5,29 @@ The touch condition deliberately reuses the base engine's own semantics
 instead of inventing new ones:
 
   - Moves resolve one after the other in game.step's order (chasing >
-    reinforcing > larger army — see game._determine_move_order). A "touch" is
+    reinforcing > smaller army — see game._determine_move_order). A "touch" is
     a move that is VALID at its own slot in that order (same validity test as
     game._execute_move) and whose destination is the opponent's general tile.
-  - That gives the defense its teeth: a counter-move onto the attacker's
-    SOURCE tile is a chase, so it goes first. Capture the source outright and
-    the touch never executes (its source is no longer the attacker's).
-    Leave the source with 2+ army — at least one unit still moves — and the
-    touch executes anyway: attacker wins.
+  - That gives the defense its teeth: a counter-move from a THIRD tile onto
+    the attacker's SOURCE is a pure chase, so it goes first. Capture the
+    source outright and the touch never executes (its source is no longer the
+    attacker's). Leave the source with 2+ army — at least one unit still
+    moves — and the touch executes anyway: attacker wins.
+  - The general launching its OWN army at the attacker's source is no
+    defense: that head-on is a mutual chase, so the tie falls to the smaller
+    army — and either the attacker moves first and touches, or the general's
+    counter moves first but is too small to strip the source. Only an exactly
+    equal army (seat-order tie) can survive that way.
   - Both players touching on the same turn is a DRAW: reported like a
     truncation draw (info.is_done with winner -1).
   - A normal general capture at/after the threshold is itself a touch, so the
     two win paths always agree.
+  - Mutual capture is a draw at EVERY turn, not just past the threshold. The
+    base game resolves the two moves in sequence and lets the second one
+    overwrite `winner`, so bare game.step hands a simultaneous decapitation to
+    whoever happened to move second — and move order is choosable
+    (game._determine_move_order), making it a tactic rather than a coin flip.
+    Detected here so the rule reads the same on turn 5 and turn 900.
 
 Composition: builds (generals.modifiers.build_castles) are rewritten to
 passes BEFORE the step, so a build next to the enemy general never counts as
@@ -78,8 +89,16 @@ def step(state: game.GameState, actions: jnp.ndarray,
 
     new_state, _ = game.step(state, actions)
 
-    both = touch[0] & touch[1]
-    one = touch[0] ^ touch[1]
+    # Mutual CAPTURE (army-based, so it needs no threshold): `mid` shows the
+    # first mover won, and the base step's final winner is somebody else — which
+    # only happens when the second mover captured a general too. _apply_move is
+    # the sole writer of `winner` and only fires on a capture, so this cannot be
+    # confused with any other outcome. Below the threshold `touch` is all-false,
+    # so this is the only thing that catches a simultaneous decapitation.
+    both_captured = (state.winner < 0) & (mid.winner >= 0) & (new_state.winner != mid.winner)
+
+    both = (touch[0] & touch[1]) | both_captured
+    one = (touch[0] ^ touch[1]) & ~both_captured
     toucher = jnp.where(touch[0], 0, 1).astype(new_state.winner.dtype)
 
     # A lone touch can only ever agree with a winner the base step already set

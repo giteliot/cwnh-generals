@@ -96,10 +96,13 @@ def material(me, opp):
     a castle reads as losing 35 soldiers: measured on a real board that was
     dPHI -0.375 at 60 army, only turning positive past ~500 -- exactly backwards,
     since early castles have the most time to compound. Counting the investment
-    makes a build *exactly* neutral at any army level, so whether it was a good
-    idea is decided by what happens next (the income it earns via `econ`, or the
-    material you lose if a 0-army castle gets sniped) rather than by a weight we
-    picked.
+    makes a build at the FLOOR price (35, i.e. 7+ tiles from your other
+    structures) exactly neutral at any army level. Crowded builds cost more than
+    35, and the leftover shows up as a penalty equal to precisely the crowding
+    surcharge you overpaid -- which is the correct signal, and nobody tuned it.
+    So whether a build was a good idea is decided by what happens next (the
+    income it earns via `econ`, or the material you lose if a 0-army castle gets
+    sniped) rather than by a weight we picked.
 
     Log-RATIO, not difference. A difference weights kills and losses equally, so
     an even 10-for-10 trade scores ~0 -- indistinguishable from never engaging.

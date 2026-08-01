@@ -15,7 +15,17 @@ from generals.core.env import GeneralsEnv
 from generals.core.game import get_observation
 
 from .actions import decode, num_actions
-from .features import NUM_GLOBALS, NUM_PLANES, extract, init_belief, reset_belief_where, update_belief
+from .features import (
+    GLOBAL_NAMES,
+    NUM_GLOBALS,
+    NUM_PLANES,
+    PLANE_NAMES,
+    extract,
+    init_belief,
+    record_move,
+    reset_belief_where,
+    update_belief,
+)
 from .masking import action_mask
 from .network import ActorCritic, log_probs, sample
 from .potential import Outcome, shaping, terminal_reward
@@ -81,8 +91,27 @@ def save(path, train_state, update, bank, key, args):
             "blocks": args.blocks,
             "groups": args.groups,
             "stage": args.stage,
+            "planes": PLANE_NAMES,
+            "globals": GLOBAL_NAMES,
         }, fh)
     os.replace(tmp, path)
+
+
+def check_features(blob, path):
+    """Old checkpoints have a different observation, and flax only reports it as
+    a cryptic kernel-shape error. Say what actually happened."""
+    saved = blob.get("planes")
+    if saved is not None and saved != PLANE_NAMES:
+        added = [p for p in PLANE_NAMES if p not in saved]
+        removed = [p for p in saved if p not in PLANE_NAMES]
+        raise SystemExit(
+            f"{path} was trained with {len(saved)} observation planes, the code now builds "
+            f"{len(PLANE_NAMES)}.\n"
+            f"  added since:   {added or 'none'}\n"
+            f"  removed since: {removed or 'none'}\n"
+            "Observation changes are not resumable. Start a fresh run, or `git stash` back to "
+            "the code this checkpoint was trained with to use it."
+        )
 
 
 def make_rollout(env, network, pool, expander, config):
@@ -122,6 +151,10 @@ def make_rollout(env, network, pool, expander, config):
             opp_move = jax.vmap(decode, in_axes=(0, None, None))(o_action, height, width)
             expander_move = jax.vmap(expander.act)(opp_obs, jrandom.split(k_exp, n))
             opp_move = jnp.where(use_expander, expander_move, opp_move)
+
+            # stamp each side's move into its own trail, so next turn sees it
+            learner_belief = jax.vmap(record_move)(learner_belief, learner_move)
+            opp_belief = jax.vmap(record_move)(opp_belief, opp_move)
 
             moves = jnp.stack([
                 jnp.where(seat[:, None], opp_move, learner_move),
@@ -200,6 +233,7 @@ def main():
     parser.add_argument("--self-prob", type=float, default=0.5)
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--bank-size", type=int, default=10)
+    parser.add_argument("--bank-threshold", type=float, default=0.55)
     parser.add_argument("--out", default="ppo_params.pkl")
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
@@ -252,8 +286,13 @@ def main():
     if args.resume and os.path.exists(args.resume):
         with open(args.resume, "rb") as fh:
             blob = pickle.load(fh)
+        check_features(blob, args.resume)
         params = to_jax(blob["params"])
-    print(f"parameters: {sum(x.size for x in jax.tree.leaves(params)):,}")
+    convs = 1 + 2 * args.blocks
+    field = 1 + 2 * convs
+    warn = "  << SMALLER THAN THE BOARD: raise --blocks" if field < max(height, width) else ""
+    print(f"parameters: {sum(x.size for x in jax.tree.leaves(params)):,} "
+          f"| receptive field {field} cells vs board {max(height, width)}{warn}")
 
     tx = optax.chain(
         optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -287,6 +326,7 @@ def main():
         )
         return carry[0], info
 
+    recent_winrate = []
     for update in range(start_update, args.updates):
         t0 = time.time()
         progress = update / max(args.updates * args.anneal_frac, 1)
@@ -321,9 +361,20 @@ def main():
             f"| alpha {alpha:.2f} | sps {args.envs * args.steps / elapsed:7.0f} | {elapsed:5.1f}s"
         )
 
+        if episodes:
+            recent_winrate.append(wins / episodes)
+            recent_winrate[:] = recent_winrate[-20:]
+
         if (update + 1) % args.checkpoint_every == 0:
-            bank.append(jax.tree.map(jnp.copy, train_state.params))
-            bank[:] = bank[-args.bank_size:]
+            # Only bank a checkpoint once it is actually beating the pool.
+            # Appending on a fixed timer fills the league with weak versions,
+            # which inflates the training win-rate and stops teaching anything.
+            strong = (len(recent_winrate) >= 10
+                      and sum(recent_winrate) / len(recent_winrate) >= args.bank_threshold)
+            if strong:
+                bank.append(jax.tree.map(jnp.copy, train_state.params))
+                bank[:] = bank[-args.bank_size:]
+                recent_winrate.clear()
             save(args.out, train_state, update + 1, bank, key, args)
 
     save(args.out, train_state, args.updates, bank, key, args)

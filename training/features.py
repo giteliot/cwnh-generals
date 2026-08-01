@@ -36,6 +36,8 @@ DEATHTOUCH_TURN = 800.0
 DEATHTOUCH_RAMP = 100.0 # start warning the agent 100 turns before deathtouch
 COST_SCALE = 64.0
 FAR = 1 << 14           # BFS "unreachable" sentinel
+MOVE_DECAY = 0.75       # how fast the move trail fades; 0.75 -> ~7 turns of history
+MOVE_TRAIL_MAX = 4.0    # 1/(1-MOVE_DECAY), the trail's saturation value
 _RADIUS = (PROXIMITY_PENALTY - 1) // PROXIMITY_DECAY
 
 
@@ -50,6 +52,8 @@ class Belief(NamedTuple):
     last_enemy_army: jnp.ndarray
     last_enemy_castle: jnp.ndarray
     general_prior: jnp.ndarray
+    move_from: jnp.ndarray
+    move_to: jnp.ndarray
 
 
 def init_belief(shape):
@@ -61,6 +65,27 @@ def init_belief(shape):
         last_enemy_army=jnp.zeros(shape, jnp.int32),
         last_enemy_castle=jnp.zeros(shape, bool),
         general_prior=jnp.full(shape, 1.0 / (h * w), jnp.float32),
+        move_from=jnp.zeros(shape, jnp.float32),
+        move_to=jnp.zeros(shape, jnp.float32),
+    )
+
+
+def record_move(belief, action):
+    """Stamp the move just taken into the trail. Call AFTER choosing an action,
+    so the next turn's observation carries it.
+
+    Without this the policy is blind to its own intent: a 50-army stack looks
+    identical whether it just arrived heading north or has sat there for 40
+    turns, so the net re-derives its plan every tick and can dither.
+    """
+    head, row, col, direction, _ = action
+    h, w = belief.move_from.shape
+    moved = jnp.where(head == 0, 1.0, 0.0)
+    di = jnp.array([-1, 1, 0, 0])[direction]
+    dj = jnp.array([0, 0, -1, 1])[direction]
+    return belief._replace(
+        move_from=belief.move_from.at[row, col].add(moved),
+        move_to=belief.move_to.at[jnp.clip(row + di, 0, h - 1), jnp.clip(col + dj, 0, w - 1)].add(moved),
     )
 
 
@@ -88,6 +113,8 @@ def update_belief(belief, obs):
         last_enemy_army=jnp.where(visible, obs.armies * enemy, belief.last_enemy_army),
         last_enemy_castle=jnp.where(visible, obs.castles & enemy, belief.last_enemy_castle),
         general_prior=prior / jnp.maximum(jnp.sum(prior), 1e-6),
+        move_from=belief.move_from * MOVE_DECAY,
+        move_to=belief.move_to * MOVE_DECAY,
     )
 
 
@@ -259,6 +286,10 @@ PLANES = (
     Plane("general_prior",   lambda v: v.belief.general_prior / jnp.maximum(jnp.max(v.belief.general_prior), 1e-6),
           "where the enemy general still could be"),
     Plane("last_enemy_castle", lambda v: v.belief.last_enemy_castle,        "castles don't move"),
+    Plane("move_from", lambda v: jnp.minimum(v.belief.move_from, MOVE_TRAIL_MAX) / MOVE_TRAIL_MAX,
+          "where you moved FROM recently, decaying -- your own recent intent"),
+    Plane("move_to",   lambda v: jnp.minimum(v.belief.move_to, MOVE_TRAIL_MAX) / MOVE_TRAIL_MAX,
+          "where you moved TO recently -- lets the net continue a push instead of re-deciding"),
 
     # --- the clock -----------------------------------------------------------
     Plane("progress",   lambda v: v.ones * (v.time / TRUNCATION),           "how close to the draw"),

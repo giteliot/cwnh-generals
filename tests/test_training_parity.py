@@ -14,7 +14,8 @@ from generals.core import game
 from generals.core.env import GeneralsEnv
 from training.actions import decode as jax_decode
 from training.actions import num_actions
-from training.features import GLOBAL_NAMES, PLANE_NAMES, init_belief, update_belief
+from training.features import GLOBAL_NAMES, PLANE_NAMES, init_belief, record_move, update_belief
+from training.features import NUM_GLOBALS, NUM_PLANES
 from training.features import extract as jax_extract
 from training.masking import action_mask as jax_mask
 from training.network import ActorCritic
@@ -74,12 +75,14 @@ def test_numpy_features_match_jax(seed, steps):
     for player in (0, 1):
         obs = game.get_observation(state, player)
         belief = update_belief(init_belief(obs.armies.shape), obs)
+        belief = record_move(belief, jnp.array([0, 3, 4, 1, 0], jnp.int32))
         planes_jax, globals_jax = jax_extract(obs, belief, player)
         mask_jax = jax_mask(obs)
 
         frame = bot.parse_frame(wire_roundtrip(obs))
         np_belief = bot.Belief(obs.armies.shape)
         np_belief.update(frame)
+        np_belief.record_move((0, 3, 4, 1, 0))
         planes_np, globals_np = bot.extract(frame, np_belief, player)
         mask_np = bot.action_mask(frame)
 
@@ -104,8 +107,8 @@ def test_numpy_forward_matches_flax(tmp_path):
     channels, blocks = 16, 2
     network = ActorCritic(channels=channels, blocks=blocks, groups=8, value_hidden=32)
     key = jrandom.PRNGKey(0)
-    planes = jrandom.normal(key, (height, width, 32)) * 0.3
-    globals_ = jrandom.normal(jrandom.PRNGKey(1), (20,)) * 0.3
+    planes = jrandom.normal(key, (height, width, NUM_PLANES)) * 0.3
+    globals_ = jrandom.normal(jrandom.PRNGKey(1), (NUM_GLOBALS,)) * 0.3
     mask = jrandom.bernoulli(jrandom.PRNGKey(2), 0.3, (num_actions(height, width),))
     mask = mask.at[-1].set(True)
 

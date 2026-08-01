@@ -25,6 +25,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 
 from generals.core.game import get_visibility
+from generals.modifiers.build_castles import BASE_COST
 
 from .features import bfs_distance
 
@@ -82,36 +83,33 @@ def economy(me, opp):
 
 
 def material(me, opp):
-    """Have more army than the opponent.
+    """Have more fighting power than the opponent — kill their soldiers, don't
+    lose yours.
 
-    This is "reward killing enemy soldiers, penalise losing your own" written
-    as a level instead of an event. The reward is the change in PHI, so
-        gamma*PHI' - PHI  ~=  (delta_my_army - delta_opp_army) / 50
-    Their army drops because you killed it -> positive. Yours drops -> negative.
-    Writing it as a level is what makes it unfarmable: an event bonus like
-    "+1 per kill" can be gamed by trading armies back and forth, a level cannot
-    because the potential returns to where it started.
+    Reward is the change in PHI, so this pays out exactly when their army drops
+    (you killed it) or yours does (you lost it). Written as a level, not an
+    event, which is what makes it unfarmable: "+1 per kill" can be gamed by
+    trading armies back and forth, a level cannot.
 
-    Linear inside the tanh (not log), so 10 soldiers killed is worth the same
-    whether you have 100 or 1000. tanh only saturates the blowout cases.
+    Army is counted as `army + 35 * structures`, i.e. the army still standing
+    PLUS the army you converted into castles. Without this, spending 35 army on
+    a castle reads as losing 35 soldiers: measured on a real board that was
+    dPHI -0.375 at 60 army, only turning positive past ~500 -- exactly backwards,
+    since early castles have the most time to compound. Counting the investment
+    makes a build *exactly* neutral at any army level, so whether it was a good
+    idea is decided by what happens next (the income it earns via `econ`, or the
+    material you lose if a 0-army castle gets sniped) rather than by a weight we
+    picked.
 
-    KNOWN LIMITATION -- revisit. Using the *difference* forces killing and
-    being killed to be weighted equally, so an even 10-for-10 trade scores ~0,
-    identical to not engaging at all. Those are very different games: an even
-    trade favours whoever is ahead on economy. Two ways out, both still valid
-    potentials:
-
-      1. Split the term, so the two weights can differ:
-             Term("kills",  0.6, lambda me, opp: -jnp.tanh(opp.army / 50))
-             Term("losses", 0.4, lambda me, opp:  jnp.tanh(me.army / 50))
-         An even trade now scores (0.4 - 0.6) * 10/50 != 0. kills > losses
-         makes an aggressive trader, losses > kills makes a hoarder.
-
-      2. Go back to a ratio: tanh(log1p(me.army) - log1p(opp.army)) rewards
-         even trades for whoever is ahead (100v50 -> 90v40 improves the ratio
-         but not the difference). Costs the linearity above -- pick one.
+    Log-RATIO, not difference. A difference weights kills and losses equally, so
+    an even 10-for-10 trade scores ~0 -- indistinguishable from never engaging.
+    The ratio distinguishes them: 100v50 -> 90v40 leaves the difference at 50 but
+    improves the ratio, so an even trade correctly favours whoever is ahead.
+    Scaled by log(2), so 2:1 is roughly full marks.
     """
-    return jnp.tanh((me.army - opp.army) / 50.0)
+    mine = me.army + BASE_COST * me.structures
+    theirs = opp.army + BASE_COST * opp.structures
+    return jnp.tanh((jnp.log1p(mine) - jnp.log1p(theirs)) / jnp.log(2.0))
 
 
 def territory(me, opp):
@@ -151,7 +149,7 @@ class Term(NamedTuple):
 TERMS = (
     Term("material", 0.5, material),      # kills and losses -- the fastest signal
     Term("territory", 0.4, territory),    # land, the other thing you see immediately
-    Term("econ", 0.4, economy),           # income; the only term that values castles
+    Term("econ", 0.4, economy),           # income: a castle is worth 25 land tiles
     Term("explore", 0.1, exploration),    # you can't attack what you can't find
     Term("threat", 0.0, aggression),      # off: costs a BFS, indirect. Turn on later.
     Term("safety", 0.0, defence),         # off: pays the agent to turtle. See docstring.

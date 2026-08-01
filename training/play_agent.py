@@ -7,7 +7,7 @@ import jax.random as jrandom
 from generals.agents.agent import Agent
 
 from .actions import decode
-from .features import extract, init_belief, update_belief
+from .features import PLANE_NAMES, extract, init_belief, update_belief
 from .masking import action_mask
 from .network import ActorCritic
 
@@ -17,6 +17,13 @@ class PPOAgent(Agent):
         super().__init__(id)
         with open(checkpoint, "rb") as fh:
             blob = pickle.load(fh)
+        saved = blob.get("planes")
+        if saved is not None and saved != PLANE_NAMES:
+            raise SystemExit(
+                f"{checkpoint} was trained with {len(saved)} observation planes, the code now "
+                f"builds {len(PLANE_NAMES)}. Observation changes break old checkpoints -- "
+                "`git stash` back to the code it was trained with, or retrain."
+            )
         self.params = blob["params"]
         self.network = ActorCritic(channels=blob["channels"], blocks=blob["blocks"], groups=blob.get("groups", 8))
         self.player_idx = player_idx

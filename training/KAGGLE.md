@@ -4,7 +4,13 @@ Free: 30 GPU-h/week, 12 h/session. Push your code first — Kaggle clones from G
 
 ## Notebook settings
 
-Accelerator: **GPU T4 x2** · Internet: **On** · Persistence: **Files only**
+Settings menu → **Accelerator: GPU T4 x2**, **Internet: On**.
+
+**`/kaggle/working` is volatile.** There is no persistence toggle — assume the
+directory is gone when the session ends. Either commit a version (Save Version →
+**Save & Run All**), which snapshots it as that version's Output, or download
+`ckpt.pkl` yourself before you stop. With `--checkpoint-every 50` you lose at
+most ~50 updates either way.
 
 ---
 
@@ -60,8 +66,8 @@ import subprocess
 LOG = "/kaggle/working/train.log"
 cmd = """cd /kaggle/working/repo && python -u -m training.train \
   --stage medium --updates 20000 \
-  --envs 4096 --steps 32 \
-  --channels 32 --blocks 4 --groups 8 \
+  --envs 2048 --steps 32 \
+  --channels 32 --blocks 8 --groups 8 \
   --minibatches 32 --epochs 2 \
   --pool-size 8192 --gamma 0.997 \
   --anneal-frac 10 --checkpoint-every 50 \
@@ -71,7 +77,8 @@ proc = subprocess.Popen(cmd, shell=True, stdout=open(LOG, "w"), stderr=subproces
 print("pid", proc.pid)
 ```
 
-Checkpoint **must** go to `/kaggle/working/` — nothing else survives the session.
+Checkpoint **must** go to `/kaggle/working/` — it's the only directory that can be
+snapshotted into a version's Output. Download it before you stop.
 
 ## Cell 5 — watch
 
@@ -90,6 +97,52 @@ while proc.poll() is None:
     time.sleep(30)
 ```
 
+## Cell 5b — auto-save to a Dataset (so a lost session doesn't cost the model)
+
+One-time: kaggle.com → *Settings → API → Create New Token*. Put `username` and
+`key` from the downloaded `kaggle.json` into **Add-ons → Secrets** as
+`KAGGLE_USERNAME` and `KAGGLE_KEY`.
+
+Run this **before** Cell 4 — the subprocess inherits the env vars:
+
+```python
+import os, json
+from kaggle_secrets import UserSecretsClient
+
+sec = UserSecretsClient()
+os.environ["KAGGLE_USERNAME"] = sec.get_secret("KAGGLE_USERNAME")
+os.environ["KAGGLE_KEY"]      = sec.get_secret("KAGGLE_KEY")
+
+UP = "/kaggle/working/upload"
+os.makedirs(UP, exist_ok=True)
+json.dump({
+    "title": "generals-ckpt",
+    "id": f"{os.environ['KAGGLE_USERNAME']}/generals-ckpt",
+    "licenses": [{"name": "CC0-1.0"}],
+}, open(f"{UP}/dataset-metadata.json", "w"))
+```
+
+Chain the upload onto Cell 4's command so it fires when training exits:
+
+```
+... --out /kaggle/working/ckpt.pkl \
+&& cp /kaggle/working/ckpt.pkl /kaggle/working/upload/ckpt.pkl \
+&& kaggle datasets version -p /kaggle/working/upload -m "auto"
+```
+
+First time only, use `kaggle datasets create -p /kaggle/working/upload` instead.
+
+`&&` only fires on a **clean exit**, which is not the case you are worried about.
+Add a periodic uploader too:
+
+```python
+import time, subprocess
+while proc.poll() is None:
+    time.sleep(1800)
+    subprocess.run("cp /kaggle/working/ckpt.pkl /kaggle/working/upload/ckpt.pkl && "
+                   "kaggle datasets version -p /kaggle/working/upload -m periodic", shell=True)
+```
+
 ## Cell 6 — stop
 
 ```python
@@ -100,18 +153,43 @@ proc.terminate()
 
 ## Watch these three
 
+0. **Receptive field >= board size**, printed at startup. `--blocks 4` gives 19
+   cells, which cannot see across a 22-wide board; `--blocks 8` gives 35.
 1. **`v` under ~1.** It hit 12,964,842 once and the policy collapsed.
 2. **Land count** from an eval — two runs ended holding 1 tile, passing every turn. Win rate won't show it.
 3. `W/L/D` moving toward W; `H` falling.
 
 ## Continuing past 12 h
 
-1. New notebook version → **Add Data → Notebook Output** → previous version.
-2. Add before Cell 4:
-   ```python
-   !cp /kaggle/input/<notebook-name>/ckpt.pkl /kaggle/working/ckpt.pkl
-   ```
-3. Run Cell 4 unchanged. Keep `--updates` identical — it's the anneal denominator.
+Keep `--updates` identical across sessions — it's the anneal denominator. Note
+it is **cumulative**: resuming at update 2100 with `--updates 12000` gives you
+9900 more, not 12000.
+
+**If you committed a version:** Add Data → **Notebook Output** → previous
+version, then before Cell 4:
+
+```python
+!cp /kaggle/input/<notebook-name>/ckpt.pkl /kaggle/working/ckpt.pkl
+```
+
+**If it didn't survive, or the checkpoint is only on your laptop** — upload it as
+a Dataset:
+
+1. [kaggle.com/datasets](https://www.kaggle.com/datasets) → **New Dataset** →
+   drag in `ckpt.pkl` → title `generals-ckpt`.
+2. Notebook → **Add Data** → *Your Datasets* → `generals-ckpt`.
+3. Before Cell 4:
+
+```python
+import shutil, os, pickle
+os.makedirs("/kaggle/working", exist_ok=True)
+shutil.copy("/kaggle/input/generals-ckpt/ckpt.pkl", "/kaggle/working/ckpt.pkl")
+print("resuming from update", pickle.load(open("/kaggle/working/ckpt.pkl","rb"))["update"])
+```
+
+`/kaggle/input` is read-only, so the copy is required. For later runs use
+**New Version** on the same dataset rather than creating a new one — attached
+notebooks pick up the latest automatically.
 
 ## Getting the model out
 
@@ -139,3 +217,4 @@ Download `ckpt.pkl` from the version's Output tab, then locally:
 | `IndexError: axis 0 with size 0` | `--pool-size` below the board-size combo count (16 for `--stage full`). |
 | Session died at ~40 min | Interactive idle timeout. For unattended runs use Save & Run All (Commit) with a blocking `!cd ... \| tee` — `Popen` is killed when the notebook ends. |
 | Log looks frozen | Missing `python -u`. |
+| `/kaggle/working` empty next session | Expected — it does not persist. Commit a version, or download `ckpt.pkl` and re-upload it as a Dataset. |

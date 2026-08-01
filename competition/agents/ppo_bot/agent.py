@@ -17,6 +17,8 @@ PROXIMITY_DECAY = 2
 RADIUS = (PROXIMITY_PENALTY - 1) // PROXIMITY_DECAY
 NUM_CELL_ACTIONS = 9
 NEG_INF = -1e9
+MOVE_DECAY = 0.75
+MOVE_TRAIL_MAX = 4.0
 WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.npz")
 
 
@@ -84,6 +86,18 @@ class Belief:
         self.last_enemy_army = np.zeros(shape, np.int32)
         self.last_enemy_castle = np.zeros(shape, bool)
         self.general_prior = np.full(shape, 1.0 / (shape[0] * shape[1]), np.float32)
+        self.move_from = np.zeros(shape, np.float32)
+        self.move_to = np.zeros(shape, np.float32)
+
+    def record_move(self, action):
+        head, row, col, direction, _ = action
+        if head != 0:
+            return
+        h, w = self.move_from.shape
+        di = (-1, 1, 0, 0)[direction]
+        dj = (0, 0, -1, 1)[direction]
+        self.move_from[row, col] += 1.0
+        self.move_to[min(max(row + di, 0), h - 1), min(max(col + dj, 0), w - 1)] += 1.0
 
     def update(self, f):
         enemy_general = f["generals"] & f["enemy"]
@@ -99,6 +113,8 @@ class Belief:
         self.last_enemy = np.where(f["visible"], f["enemy"], self.last_enemy)
         self.last_enemy_army = np.where(f["visible"], f["armies"] * f["enemy"], self.last_enemy_army)
         self.last_enemy_castle = np.where(f["visible"], f["castles"] & f["enemy"], self.last_enemy_castle)
+        self.move_from *= MOVE_DECAY
+        self.move_to *= MOVE_DECAY
 
 
 def parse_frame(obs):
@@ -190,6 +206,8 @@ PLANES = [
     Plane("last_enemy_army", lambda v: log_scale(v["belief"].last_enemy_army)),
     Plane("general_prior",   lambda v: v["belief"].general_prior / max(v["belief"].general_prior.max(), 1e-6)),
     Plane("last_enemy_castle", lambda v: v["belief"].last_enemy_castle),
+    Plane("move_from", lambda v: np.minimum(v["belief"].move_from, MOVE_TRAIL_MAX) / MOVE_TRAIL_MAX),
+    Plane("move_to",   lambda v: np.minimum(v["belief"].move_to, MOVE_TRAIL_MAX) / MOVE_TRAIL_MAX),
     Plane("progress",   lambda v: v["ones"] * (v["turn"] / TRUNCATION)),
     Plane("even_tick",  lambda v: v["ones"] * (v["turn"] % 2)),
     Plane("deathtouch", lambda v: v["ones"] * np.clip(
@@ -351,4 +369,6 @@ class Agent:
         planes, globals_ = extract(f, self.belief, self.player_id)
         mask = action_mask(f)
         logits = self.network(planes, globals_, mask)
-        return decode(int(np.argmax(logits)), *self.shape)
+        action = decode(int(np.argmax(logits)), *self.shape)
+        self.belief.record_move(action)
+        return action

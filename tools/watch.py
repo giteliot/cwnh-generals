@@ -26,7 +26,8 @@ AGENTS = {
 
 def build(spec, player_idx, temperature):
     if spec.startswith("ppo:"):
-        return PPOAgent(spec[4:], id="ppo", player_idx=player_idx, temperature=temperature)
+        path = spec[4:]
+        return PPOAgent(path, id=Path(path).stem, player_idx=player_idx, temperature=temperature)
     return AGENTS[spec](id=spec)
 
 

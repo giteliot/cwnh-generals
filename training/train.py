@@ -40,7 +40,7 @@ STAGES = {
 
 DEFAULT_CONFIG = dict(
     LR=3e-4,
-    GAMMA=0.999,
+    GAMMA=0.9999,
     GAE_LAMBDA=0.95,
     CLIP_EPS=0.2,
     VF_COEF=0.5,
@@ -215,7 +215,7 @@ def main():
     parser.add_argument("--minibatches", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--gamma", type=float, default=0.999)
+    parser.add_argument("--gamma", type=float, default=0.9999)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--win", type=float, default=10.0)
     parser.add_argument("--loss", type=float, default=-6.0)

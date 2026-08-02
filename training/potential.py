@@ -201,6 +201,23 @@ def draw_score(state, p):
 # better in expectation than a certain draw, which is the opposite of the
 # turtling the agent found on its own.
 
+# GAMMA MATTERS AS MUCH AS THESE NUMBERS. A terminal reward T steps away is
+# worth gamma^T at t=0, and episodes run to 1200:
+#
+#   gamma    win@1200   early/late   shaping leak over 1200 turns
+#   0.997      0.27       27x         +3.35   <- terminal 5x WEAKER than shaping
+#   0.999      3.01        3x         +1.12
+#   0.9999     8.87      1.12x        +0.11   <- terminal 6.8x stronger
+#
+# Two separate failures at gamma=0.997. The terminal is discounted into
+# irrelevance, AND a constant potential pays (gamma-1)*PHI every step -- which
+# is POSITIVE while you are behind, so a draw from a losing position scored net
+# positive and the agent was content to sit at 0 wins / 52 draws.
+#
+# Episodes are bounded (<=1200) and rewards are bounded, so discounting is not
+# needed for convergence. gamma near 1 keeps "winning early is marginally
+# better" as a real but small preference, which is the intended semantics.
+
 WIN = 10.0
 LOSS = -9.0
 DRAW = -2.0

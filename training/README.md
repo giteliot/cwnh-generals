@@ -35,7 +35,7 @@ Play: arrows move cursor · `Enter` pick source · arrow to move (`Shift` = spli
 .venv/bin/python -m training.train --stage medium --updates 4000 \
   --envs 2048 --steps 32 --channels 32 --blocks 8 --groups 8 \
   --minibatches 32 --epochs 2 --pool-size 8192 \
-  --gamma 0.997 --anneal-frac 10 --checkpoint-every 50 \
+  --gamma 0.9999 --anneal-frac 10 --checkpoint-every 50 \
   --resume ckpt.pkl --out ckpt.pkl
 ```
 

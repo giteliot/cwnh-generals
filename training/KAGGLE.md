@@ -69,7 +69,7 @@ cmd = """cd /kaggle/working/repo && python -u -m training.train \
   --envs 2048 --steps 32 \
   --channels 32 --blocks 8 --groups 8 \
   --minibatches 32 --epochs 2 \
-  --pool-size 8192 --gamma 0.997 \
+  --pool-size 8192 --gamma 0.9999 \
   --anneal-frac 10 --checkpoint-every 50 \
   --resume /kaggle/working/ckpt.pkl \
   --out    /kaggle/working/ckpt.pkl"""

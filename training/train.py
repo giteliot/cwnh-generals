@@ -2,6 +2,7 @@ import argparse
 import os
 import pickle
 import time
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -10,7 +11,8 @@ import numpy as np
 import optax
 from flax.training.train_state import TrainState
 
-from generals.agents import ExpanderAgent
+from generals.agents import ExpanderAgent, HunterAgent, RandomAgent
+from generals.agents.harvester_agent import HarvesterAgent
 from generals.core.env import GeneralsEnv
 from generals.core.game import get_observation
 
@@ -77,7 +79,7 @@ def to_jax(tree):
     return jax.tree.map(jnp.asarray, tree)
 
 
-def save(path, train_state, update, bank, key, args):
+def save(path, train_state, update, bank, bank_stats, key, args):
     tmp = f"{path}.tmp"
     with open(tmp, "wb") as fh:
         pickle.dump({
@@ -86,6 +88,7 @@ def save(path, train_state, update, bank, key, args):
             "step": int(train_state.step),
             "update": update,
             "bank": [to_numpy(b) for b in bank],
+            "bank_stats": bank_stats,
             "key": np.asarray(jrandom.key_data(key)),
             "channels": args.channels,
             "blocks": args.blocks,
@@ -114,13 +117,80 @@ def check_features(blob, path):
         )
 
 
-def make_rollout(env, network, pool, expander, config):
+# Opponent pool. Index 0-3 are scripted, index 4 is a network (current policy
+# or a banked checkpoint). RandomAgent is only used in the opening phase.
+SCRIPTED = ("random", "expander", "hunter", "harvester")
+NETWORK = len(SCRIPTED)
+
+
+def build_scripted():
+    return [RandomAgent(), ExpanderAgent(), HunterAgent(), HarvesterAgent()]
+
+
+class Opponent(NamedTuple):
+    kind: int          # 0-3 scripted, 4 network
+    label: str
+    bank_idx: int      # index into bank, or -1
+
+
+def opponent_mix(p, args):
+    """Scripted share and random's share within it, both linear to zero.
+
+    Scripted bots are our stand-in for the behaviour cloning we cannot do (the
+    human replays are for a different ruleset), so they are a bootstrap, not a
+    permanent anchor -- ML-Agents, OpenAI Five and AlphaStar all end up at pure
+    self-play. Hence linear to 0 rather than a floor.
+    """
+    if p <= args.opp_all_bots:
+        scripted = 1.0
+    else:
+        span = max(args.opp_mix_by - args.opp_all_bots, 1e-9)
+        scripted = max(0.0, 1.0 - (p - args.opp_all_bots) / span)
+    random_share = max(0.0, 1.0 - p / max(args.opp_no_random, 1e-9))
+    return scripted, random_share
+
+
+def pfsp_weights(stats, power):
+    """AlphaStar's prioritised fictitious self-play: sample the checkpoints that
+    beat us more often. `stats[i]` is [our_wins, games] against bank[i]; an
+    unplayed entry is treated as an even matchup."""
+    w = []
+    for wins, games in stats:
+        winrate = wins / games if games else 0.5
+        w.append(max(1.0 - winrate, 1e-3) ** power)
+    total = sum(w) or 1.0
+    return [x / total for x in w]
+
+
+def choose_opponent(update, args, bank, bank_stats, key):
+    """Pick this update's opponent (held for --opp-swap-every updates)."""
+    scripted_prob, random_share = opponent_mix(update / max(args.updates, 1), args)
+    k_type, k_bot, k_net, k_bank = jrandom.split(key, 4)
+
+    if float(jrandom.uniform(k_type)) < scripted_prob:
+        if float(jrandom.uniform(k_bot)) < random_share:
+            return Opponent(0, SCRIPTED[0], -1)
+        kind = 1 + int(jrandom.randint(k_bot, (), 0, len(SCRIPTED) - 1))
+        return Opponent(kind, SCRIPTED[kind], -1)
+
+    # Network opponent. "self" is the LIVE current policy, resolved fresh each
+    # update; ML-Agents and OpenAI Five both make the latest policy the majority
+    # opponent because it is the strongest learning signal. Banked snapshots are
+    # for robustness against cycling, not the main driver.
+    if bank and float(jrandom.uniform(k_net)) > args.self_prob:
+        weights = pfsp_weights(bank_stats, args.pfsp_power)
+        i = int(jrandom.choice(k_bank, len(bank), p=jnp.asarray(weights)))
+        return Opponent(NETWORK, f"bank[{i}]", i)
+    return Opponent(NETWORK, "self", -1)
+
+
+def make_rollout(env, network, pool, scripted, config):
     def encode_side(obs, belief, player):
         belief = update_belief(belief, obs)
         planes, globals_ = extract(obs, belief, player)
         return belief, planes, globals_, action_mask(obs)
 
-    def rollout(params, opp_params, state, learner_belief, opp_belief, seat, use_expander, alpha, w_explore, key):
+    def rollout(params, opp_params, state, learner_belief, opp_belief, seat, opp_kind, alpha, w_explore, key):
         weights = config["POTENTIAL_WEIGHTS"]
         def env_step(carry, _):
             state, learner_belief, opp_belief, key = carry
@@ -138,19 +208,28 @@ def make_rollout(env, network, pool, expander, config):
             )
 
             logits, value = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(params, planes, globals_, mask)
-            o_logits, _ = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(opp_params, o_planes, o_globals, o_mask)
 
-            key, k_act, k_opp, k_exp = jrandom.split(key, 4)
+            key, k_act, k_opp = jrandom.split(key, 3)
             n = seat.shape[0]
             action = jax.vmap(sample)(logits, jrandom.split(k_act, n))
             log_prob = jnp.take_along_axis(jax.vmap(log_probs)(logits), action[:, None], axis=1)[:, 0]
-            o_action = jax.vmap(sample)(o_logits, jrandom.split(k_opp, n))
 
             height, width = state.armies.shape[1:]
             learner_move = jax.vmap(decode, in_axes=(0, None, None))(action, height, width)
-            opp_move = jax.vmap(decode, in_axes=(0, None, None))(o_action, height, width)
-            expander_move = jax.vmap(expander.act)(opp_obs, jrandom.split(k_exp, n))
-            opp_move = jnp.where(use_expander, expander_move, opp_move)
+
+            # lax.switch runs exactly one branch, so a scripted opponent costs no
+            # network forward and vice versa. All branches are traced at compile.
+            def net_branch(_):
+                o_logits, _ = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
+                    opp_params, o_planes, o_globals, o_mask)
+                idx = jax.vmap(sample)(o_logits, jrandom.split(k_opp, n))
+                return jax.vmap(decode, in_axes=(0, None, None))(idx, height, width)
+
+            def bot_branch(agent):
+                return lambda _: jax.vmap(agent.act)(opp_obs, jrandom.split(k_opp, n))
+
+            opp_move = jax.lax.switch(
+                opp_kind, [bot_branch(a) for a in scripted] + [net_branch], 0)
 
             # stamp each side's move into its own trail, so next turn sees it
             learner_belief = jax.vmap(record_move)(learner_belief, learner_move)
@@ -229,7 +308,11 @@ def main():
     parser.add_argument("--w-explore", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--anneal-frac", type=float, default=0.6)
-    parser.add_argument("--expander-prob", type=float, default=0.2)
+    parser.add_argument("--opp-all-bots", type=float, default=0.05)
+    parser.add_argument("--opp-no-random", type=float, default=0.20)
+    parser.add_argument("--opp-mix-by", type=float, default=0.60)
+    parser.add_argument("--opp-swap-every", type=int, default=10)
+    parser.add_argument("--pfsp-power", type=float, default=2.0)
     parser.add_argument("--self-prob", type=float, default=0.5)
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--bank-size", type=int, default=10)
@@ -273,7 +356,12 @@ def main():
     states = jax.tree.map(lambda x: x[: args.envs], pool)
     states = states._replace(pool_idx=jnp.arange(args.envs, dtype=jnp.int32))
     seat = (jnp.arange(args.envs) % 2).astype(bool)
+    # Each side needs its OWN memory. Feeding one belief to both, then keeping
+    # only the learner's, hands the opponent its enemy's map knowledge and move
+    # trail every rollout -- it plays blind and the learner "wins" 98% of games
+    # against a crippled copy of itself.
     beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
+    opp_beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
 
     network = ActorCritic(channels=args.channels, blocks=args.blocks, groups=args.groups)
     params = network.init(
@@ -300,10 +388,13 @@ def main():
     )
     train_state = TrainState.create(apply_fn=network.apply, params=params, tx=tx)
 
-    start_update, bank = 0, []
+    start_update, bank, bank_stats = 0, [], []
     if blob is not None:
         start_update = blob.get("update", 0)
         bank = [to_jax(b) for b in blob.get("bank", [])]
+        bank_stats = [list(x) for x in blob.get("bank_stats", [])]
+        if len(bank_stats) != len(bank):          # older checkpoint, or drift
+            bank_stats = [[0.0, 0.0] for _ in bank]
         if "opt_state" in blob:
             train_state = train_state.replace(
                 opt_state=to_jax(blob["opt_state"]), step=blob.get("step", 0)
@@ -315,7 +406,7 @@ def main():
             f"bank {len(bank)}, optimizer {'restored' if 'opt_state' in blob else 'RESET'}"
         )
 
-    rollout = jax.jit(make_rollout(env, network, pool, ExpanderAgent(), config))
+    rollout = jax.jit(make_rollout(env, network, pool, build_scripted(), config))
     update_epoch = make_update(network.apply, config)
 
     @jax.jit
@@ -327,6 +418,7 @@ def main():
         return carry[0], info
 
     recent_winrate = []
+    held = None
     for update in range(start_update, args.updates):
         t0 = time.time()
         progress = update / max(args.updates * args.anneal_frac, 1)
@@ -334,18 +426,19 @@ def main():
         w_explore = float(max(0.0, 0.2 * (1.0 - 3.0 * progress)))
 
         key, k_roll, k_learn, k_opp = jrandom.split(key, 4)
-        use_expander = jrandom.uniform(k_opp) < args.expander_prob
-        if bank and float(jrandom.uniform(k_opp)) > args.self_prob:
-            opp_params = bank[int(jrandom.randint(k_opp, (), 0, len(bank)))]
-        else:
-            opp_params = train_state.params
+        # Hold one opponent for --opp-swap-every updates. Resampling every
+        # update (what we did before) never gives a clean gradient toward
+        # beating anyone; ML-Agents holds one fixed for ~10k steps for exactly
+        # this reason. `held is None` covers the first update after a resume.
+        if held is None or update % max(args.opp_swap_every, 1) == 0:
+            held = choose_opponent(update, args, bank, bank_stats, k_opp)
+        opp_params = bank[held.bank_idx] if held.bank_idx >= 0 else train_state.params
 
         carry, traj, last_value, outcome, done = rollout(
-            train_state.params, opp_params, states, beliefs, beliefs, seat,
-            use_expander, alpha, w_explore, k_roll,
+            train_state.params, opp_params, states, beliefs, opp_beliefs, seat,
+            jnp.int32(held.kind), alpha, w_explore, k_roll,
         )
-        states, learner_belief, opp_belief, _ = carry
-        beliefs = learner_belief
+        states, beliefs, opp_beliefs, _ = carry
         train_state, info = learn(train_state, traj, last_value, k_learn)
 
         episodes = int(done.sum())
@@ -354,16 +447,24 @@ def main():
         draws = episodes - wins - losses
         elapsed = time.time() - t0
         total_loss, value_loss, actor_loss, ent = [float(jnp.mean(x)) for x in info]
+        # rew: mean reward per env over this rollout (terminal + alpha*shaping).
+        # ep:  mean reward per finished episode, 0 when none finished.
+        rew = float(traj.reward.sum(axis=0).mean())
+        ep_rew = float(traj.reward.sum()) / episodes if episodes else 0.0
 
         print(
             f"upd {update:5d} | loss {total_loss:+.3f} v {value_loss:.3f} pi {actor_loss:+.3f} "
-            f"H {ent:.2f} | eps {episodes:4d} W/L/D {wins:3d}/{losses:3d}/{draws:3d} "
-            f"| alpha {alpha:.2f} | sps {args.envs * args.steps / elapsed:7.0f} | {elapsed:5.1f}s"
+            f"H {ent:.2f} | rew {rew:+.3f} ep {ep_rew:+.2f} "
+            f"| eps {episodes:4d} W/L/D {wins:3d}/{losses:3d}/{draws:3d} "
+            f"| vs {held.label:9s} | alpha {alpha:.2f} | sps {args.envs * args.steps / elapsed:7.0f} | {elapsed:5.1f}s"
         )
 
         if episodes:
             recent_winrate.append(wins / episodes)
             recent_winrate[:] = recent_winrate[-20:]
+            if held.bank_idx >= 0:
+                bank_stats[held.bank_idx][0] += wins
+                bank_stats[held.bank_idx][1] += episodes
 
         if (update + 1) % args.checkpoint_every == 0:
             # Only bank a checkpoint once it is actually beating the pool.
@@ -373,11 +474,14 @@ def main():
                       and sum(recent_winrate) / len(recent_winrate) >= args.bank_threshold)
             if strong:
                 bank.append(jax.tree.map(jnp.copy, train_state.params))
+                bank_stats.append([0.0, 0.0])
                 bank[:] = bank[-args.bank_size:]
+                bank_stats[:] = bank_stats[-args.bank_size:]   # stay aligned
                 recent_winrate.clear()
-            save(args.out, train_state, update + 1, bank, key, args)
+                held = None                                    # re-pick vs the new pool
+            save(args.out, train_state, update + 1, bank, bank_stats, key, args)
 
-    save(args.out, train_state, args.updates, bank, key, args)
+    save(args.out, train_state, args.updates, bank, bank_stats, key, args)
     print(f"saved {args.out}")
 
 

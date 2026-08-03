@@ -15,6 +15,7 @@ class Transition(NamedTuple):
     planes: jnp.ndarray
     globals_: jnp.ndarray
     mask: jnp.ndarray
+    opponent: jnp.ndarray
 
 
 def quantize(planes):
@@ -45,8 +46,8 @@ def compute_gae(traj, last_value, gamma, lam):
 
 def make_update(apply_fn, config):
     def loss_fn(params, traj, gae, targets):
-        logits, value = jax.vmap(apply_fn, in_axes=(None, 0, 0, 0))(
-            params, dequantize(traj.planes), traj.globals_, traj.mask
+        logits, value = jax.vmap(apply_fn, in_axes=(None, 0, 0, 0, 0))(
+            params, dequantize(traj.planes), traj.globals_, traj.mask, traj.opponent
         )
         lp = jax.vmap(log_probs)(logits)
         log_prob = jnp.take_along_axis(lp, traj.action[:, None], axis=1)[:, 0]

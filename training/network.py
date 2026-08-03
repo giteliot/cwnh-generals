@@ -7,7 +7,8 @@ from flax.linen.initializers import orthogonal
 from .actions import NUM_CELL_ACTIONS
 
 NEG_INF = -1e9
-VALUE_SCALE = 20.0   # > max |return| (terminal ~10 + shaping ~1.4); see potential.REWARD_BOUND
+VALUE_SCALE = 20.0       # > max |return| (terminal ~10 + shaping ~1.4); see potential.REWARD_BOUND
+NUM_OPPONENT_KINDS = 6   # random, expander, hunter, harvester, self, bank
 
 
 class ResBlock(nn.Module):
@@ -31,7 +32,17 @@ class ActorCritic(nn.Module):
     value_hidden: int = 256
 
     @nn.compact
-    def __call__(self, planes, globals_, mask):
+    def __call__(self, planes, globals_, mask, opponent=None):
+        """opponent: one-hot over NUM_OPPONENT_KINDS, fed ONLY to the value head.
+
+        Episode return swings ~12 points with who we are playing (+9.8 vs
+        RandomAgent, -2.6 vs a banked checkpoint) while the board looks the
+        same, so a critic that cannot see the opponent can only learn a blend
+        and carries irreducible error -- which poisons the advantages and
+        collapsed two runs at update ~4080. Asymmetric actor-critic: the policy
+        path never sees this, so inference is unchanged and the submitted NumPy
+        bot (which never computes the value head) needs no mirror.
+        """
         x = nn.Conv(self.channels, (3, 3), kernel_init=orthogonal(jnp.sqrt(2)))(planes)
         x = x + nn.Dense(self.channels, kernel_init=orthogonal(jnp.sqrt(2)))(globals_)
         x = nn.relu(x)
@@ -39,13 +50,16 @@ class ActorCritic(nn.Module):
             x = ResBlock(self.channels, self.groups)(x)
 
         pooled = jnp.concatenate([x.mean(axis=(0, 1)), x.max(axis=(0, 1)), globals_])
+        if opponent is None:
+            opponent = jnp.zeros((NUM_OPPONENT_KINDS,), pooled.dtype)
 
         spatial = nn.Conv(NUM_CELL_ACTIONS, (1, 1), kernel_init=orthogonal(0.01))(x)
         spatial = jnp.transpose(spatial, (2, 0, 1)).reshape(-1)
         pass_logit = nn.Dense(1, kernel_init=orthogonal(0.01))(pooled)
         logits = jnp.where(mask, jnp.concatenate([spatial, pass_logit]), NEG_INF)
 
-        v = nn.Dense(self.value_hidden, kernel_init=orthogonal(jnp.sqrt(2)))(pooled)
+        v = nn.Dense(self.value_hidden, kernel_init=orthogonal(jnp.sqrt(2)))(
+            jnp.concatenate([pooled, opponent]))
         v = nn.relu(v)
         v = nn.Dense(1, kernel_init=orthogonal(1.0))(v)[0]
 

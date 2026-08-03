@@ -29,7 +29,7 @@ from .features import (
     update_belief,
 )
 from .masking import action_mask
-from .network import ActorCritic, log_probs, sample
+from .network import NUM_OPPONENT_KINDS, ActorCritic, log_probs, sample
 from .potential import DRAW, DRAW_TIEBREAK, LOSS, WIN, Outcome, shaping, terminal_reward
 from .ppo_core import Transition, compute_gae, make_update, quantize
 
@@ -132,6 +132,14 @@ class Opponent(NamedTuple):
     label: str
     bank_idx: int      # index into bank, or -1
 
+    def one_hot(self):
+        """Identity for the critic: the four bots, self, and bank get distinct
+        slots. Which bank entry does not matter -- what the critic needs is
+        'this game is worth ~+9.8' vs '~-2.6', and all bank entries sit in the
+        same regime."""
+        i = self.kind if self.kind != NETWORK else (NETWORK + (self.bank_idx >= 0))
+        return jnp.eye(NUM_OPPONENT_KINDS, dtype=jnp.float32)[i]
+
 
 LEAGUE_DECAY = 0.98      # per-update EMA on stats: ~50-update memory, so a
                          # regression against a "beaten" opponent resurfaces it
@@ -194,7 +202,8 @@ def make_rollout(env, network, pool, scripted, config):
         planes, globals_ = extract(obs, belief, player)
         return belief, planes, globals_, action_mask(obs)
 
-    def rollout(params, opp_params, state, learner_belief, opp_belief, seat, opp_kind, alpha, w_explore, key):
+    def rollout(params, opp_params, state, learner_belief, opp_belief, seat, opp_kind, opp_hot,
+                alpha, w_explore, key):
         weights = config["POTENTIAL_WEIGHTS"]
         def env_step(carry, _):
             state, learner_belief, opp_belief, key = carry
@@ -211,7 +220,9 @@ def make_rollout(env, network, pool, scripted, config):
                 opp_obs, opp_belief, 1 - learner_player
             )
 
-            logits, value = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(params, planes, globals_, mask)
+            hot = jnp.broadcast_to(opp_hot, (seat.shape[0], NUM_OPPONENT_KINDS))
+            logits, value = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
+                params, planes, globals_, mask, hot)
 
             key, k_act, k_opp = jrandom.split(key, 3)
             n = seat.shape[0]
@@ -225,7 +236,7 @@ def make_rollout(env, network, pool, scripted, config):
             # network forward and vice versa. All branches are traced at compile.
             def net_branch(_):
                 o_logits, _ = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
-                    opp_params, o_planes, o_globals, o_mask)
+                    opp_params, o_planes, o_globals, o_mask)   # opponent's own value unused
                 idx = jax.vmap(sample)(o_logits, jrandom.split(k_opp, n))
                 return jax.vmap(decode, in_axes=(0, None, None))(idx, height, width)
 
@@ -264,6 +275,7 @@ def make_rollout(env, network, pool, scripted, config):
                 planes=quantize(planes),
                 globals_=globals_,
                 mask=mask,
+                opponent=hot,
             )
             learner_belief = jax.vmap(reset_belief_where)(learner_belief, done)
             opp_belief = jax.vmap(reset_belief_where)(opp_belief, done)
@@ -278,7 +290,9 @@ def make_rollout(env, network, pool, scripted, config):
         obs1 = jax.vmap(get_observation, in_axes=(0, None))(state, 1)
         learner_obs = jax.vmap(pick)(seat, obs0, obs1)
         _, planes, globals_, mask = jax.vmap(encode_side)(learner_obs, learner_belief, seat.astype(jnp.int32))
-        _, last_value = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(params, planes, globals_, mask)
+        hot = jnp.broadcast_to(opp_hot, (seat.shape[0], NUM_OPPONENT_KINDS))
+        _, last_value = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
+            params, planes, globals_, mask, hot)
 
         return carry, traj, last_value, outcome, done
 
@@ -321,6 +335,7 @@ def main():
     parser.add_argument("--bank-threshold", type=float, default=0.55)
     parser.add_argument("--out", default="ppo_params.pkl")
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--reseed", action="store_true")
     args = parser.parse_args()
 
     config = dict(
@@ -372,6 +387,7 @@ def main():
         jnp.zeros((height, width, NUM_PLANES), jnp.float32),
         jnp.zeros((NUM_GLOBALS,), jnp.float32),
         jnp.ones((num_actions(height, width),), bool),
+        jnp.zeros((NUM_OPPONENT_KINDS,), jnp.float32),
     )
     blob = None
     if args.resume and os.path.exists(args.resume):
@@ -400,7 +416,10 @@ def main():
             train_state = train_state.replace(
                 opt_state=to_jax(blob["opt_state"]), step=blob.get("step", 0)
             )
-        if "key" in blob:
+        # The saved key makes a resume replay the identical stream -- same maps,
+        # same opponent draws, same action samples. Two runs walked into the same
+        # bad batch at update ~4080 that way. --reseed breaks the replay.
+        if "key" in blob and not args.reseed:
             key = jrandom.wrap_key_data(jnp.asarray(blob["key"]))
         print(
             f"resumed {args.resume}: update {start_update}/{args.updates}, "
@@ -442,7 +461,7 @@ def main():
 
         carry, traj, last_value, outcome, done = rollout(
             train_state.params, opp_params, states, beliefs, opp_beliefs, seat,
-            jnp.int32(held.kind), alpha, w_explore, k_roll,
+            jnp.int32(held.kind), held.one_hot(), alpha, w_explore, k_roll,
         )
         states, beliefs, opp_beliefs, _ = carry
         train_state, info = learn(train_state, traj, last_value, k_learn)

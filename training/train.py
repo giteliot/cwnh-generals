@@ -366,6 +366,7 @@ def main():
     parser.add_argument("--self-prob", type=float, default=0.5)
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--bank-size", type=int, default=10)
+    parser.add_argument("--no-stagger", action="store_true")
     parser.add_argument("--bank-threshold", type=float, default=0.55)
     parser.add_argument("--out", default="ppo_params.pkl")
     parser.add_argument("--resume", default=None)
@@ -415,6 +416,21 @@ def main():
     beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
     opp_beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
     returns_so_far = jnp.zeros((args.envs,), jnp.float32)
+
+    # Stagger the env clocks. Every env starts at turn 0, so without this they
+    # all reach the 1200-turn truncation on the SAME update and reset together:
+    # the terminal signal arrives in one lump every ~37 updates and `eps` reads
+    # 0 in between, leaving the agent trained almost entirely on shaping.
+    # Offsetting the first episode spreads the endings out permanently. Capped
+    # below the turn-800 deathtouch so the opening episode is not decided
+    # instantly on a board that has not developed.
+    if not args.no_stagger:
+        key, k_stagger = jrandom.split(key)
+        span = min(env.truncation, 700)
+        states = states._replace(
+            time=jrandom.randint(k_stagger, (args.envs,), 0, span).astype(states.time.dtype)
+        )
+        print(f"staggered env clocks across turns 0-{span - 1}")
 
     network = ActorCritic(channels=args.channels, blocks=args.blocks, groups=args.groups)
     params = network.init(

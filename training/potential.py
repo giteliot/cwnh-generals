@@ -225,8 +225,8 @@ def draw_score(state, p):
 # better" as a real but small preference, which is the intended semantics.
 
 WIN = 10.0
-LOSS = -6.0
-DRAW = -2.0
+LOSS = -10.0
+DRAW = -5.0
 DRAW_TIEBREAK = 1.0     # a draw while ahead on income hurts less than one behind
 
 
@@ -240,8 +240,17 @@ class Outcome(NamedTuple):
 def terminal_reward(raw, terminated, truncated, state, p, outcome=Outcome()):
     """Map the engine's +1/-1/0 onto the shaped terminal value.
 
-    raw is +1 win, -1 loss, 0 otherwise. A terminated game with raw == 0 is a
-    mutual deathtouch, which is a genuine draw. Non-final steps return 0.
+    raw is +1 win, -1 loss, 0 otherwise.
+
+    Three ways a game ends, and TWO of them are draws that must score the same:
+      terminated, raw != 0   -> someone was decapitated       -> win / loss
+      terminated, raw == 0   -> mutual deathtouch             -> draw
+      truncated              -> stalled out at turn 1200      -> draw
+    A 1200-turn stall and a mutual kill both land on `drawn`; only the income
+    tiebreak separates them, so a 1-tile turtle scores DRAW - tiebreak while an
+    expander that merely ran out of clock scores DRAW + tiebreak.
+
+    Non-final steps return 0.
     """
     decided = jnp.where(raw > 0, outcome.win, outcome.loss)
     drawn = outcome.draw + outcome.tiebreak * draw_score(state, p)

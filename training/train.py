@@ -228,11 +228,11 @@ def make_rollout(env, network, pool, scripted, config):
         planes, globals_ = extract(obs, belief, player)
         return belief, planes, globals_, action_mask(obs)
 
-    def rollout(params, opp_params, state, learner_belief, opp_belief, seat, opp_kind, opp_hot,
+    def rollout(params, opp_params, state, learner_belief, opp_belief, ret, seat, opp_kind, opp_hot,
                 alpha, w_explore, key):
         weights = config["POTENTIAL_WEIGHTS"]
         def env_step(carry, _):
-            state, learner_belief, opp_belief, key = carry
+            state, learner_belief, opp_belief, ret, key = carry
             obs0 = jax.vmap(get_observation, in_axes=(0, None))(state, 0)
             obs1 = jax.vmap(get_observation, in_axes=(0, None))(state, 1)
             learner_obs = jax.vmap(pick)(seat, obs0, obs1)
@@ -305,12 +305,20 @@ def make_rollout(env, network, pool, scripted, config):
             )
             learner_belief = jax.vmap(reset_belief_where)(learner_belief, done)
             opp_belief = jax.vmap(reset_belief_where)(opp_belief, done)
-            return (new_state, learner_belief, opp_belief, key), (transition, raw, done)
 
-        carry, (traj, outcome, done) = jax.lax.scan(
-            env_step, (state, learner_belief, opp_belief, key), None, config["NUM_STEPS"]
+            # True cumulative reward per episode: accumulate every step, read it
+            # out when the game ends, then reset. Carried across rollouts, since
+            # episodes (up to 1200 turns) far outlive a 32-step rollout.
+            ret = ret + transition.reward
+            episode_return = jnp.where(done, ret, 0.0)
+            ret = jnp.where(done, 0.0, ret)
+            return ((new_state, learner_belief, opp_belief, ret, key),
+                    (transition, raw, outcome, episode_return, done))
+
+        carry, (traj, raw, terminal, ep_return, done) = jax.lax.scan(
+            env_step, (state, learner_belief, opp_belief, ret, key), None, config["NUM_STEPS"]
         )
-        state, learner_belief, opp_belief, key = carry
+        state, learner_belief, opp_belief, ret, key = carry
 
         obs0 = jax.vmap(get_observation, in_axes=(0, None))(state, 0)
         obs1 = jax.vmap(get_observation, in_axes=(0, None))(state, 1)
@@ -320,7 +328,7 @@ def make_rollout(env, network, pool, scripted, config):
         _, last_value = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
             params, planes, globals_, mask, hot)
 
-        return carry, traj, last_value, outcome, done
+        return carry, traj, last_value, raw, terminal, ep_return, done
 
     return rollout
 
@@ -406,6 +414,7 @@ def main():
     # against a crippled copy of itself.
     beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
     opp_beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
+    returns_so_far = jnp.zeros((args.envs,), jnp.float32)
 
     network = ActorCritic(channels=args.channels, blocks=args.blocks, groups=args.groups)
     params = network.init(
@@ -485,11 +494,11 @@ def main():
             held = choose_opponent(args, bank, league, k_opp)
         opp_params = bank[held.bank_idx] if held.bank_idx >= 0 else train_state.params
 
-        carry, traj, last_value, outcome, done = rollout(
-            train_state.params, opp_params, states, beliefs, opp_beliefs, seat,
+        carry, traj, last_value, outcome, terminal, ep_return, done = rollout(
+            train_state.params, opp_params, states, beliefs, opp_beliefs, returns_so_far, seat,
             jnp.int32(held.kind), held.one_hot(), alpha, w_explore, k_roll,
         )
-        states, beliefs, opp_beliefs, _ = carry
+        states, beliefs, opp_beliefs, returns_so_far, _ = carry
         train_state, info = learn(train_state, traj, last_value, k_learn)
 
         episodes = int(done.sum())
@@ -501,11 +510,16 @@ def main():
         # rew: mean reward per env over this rollout (terminal + alpha*shaping).
         # ep:  mean reward per finished episode, 0 when none finished.
         rew = float(traj.reward.sum(axis=0).mean())
-        ep_rew = float(traj.reward.sum()) / episodes if episodes else 0.0
+        # Mean TERMINAL value of the episodes that finished (win +10 / loss -6 /
+        # draw -2 +/- tiebreak). Dividing total rollout reward by episode count
+        # is meaningless when few episodes finish -- it attributes 65k
+        # transitions of shaping across 2048 envs to a handful of endings.
+        ep_rew = float((ep_return * done).sum()) / episodes if episodes else 0.0
+        ep_term = float((terminal * done).sum()) / episodes if episodes else 0.0
 
         print(
             f"upd {update:5d} | loss {total_loss:+.3f} v {value_loss:.3f} pi {actor_loss:+.3f} "
-            f"H {ent:.2f} kl {kl:.3f}/{applied:.0%} | rew {rew:+.3f} ep {ep_rew:+.2f} "
+            f"H {ent:.2f} kl {kl:.3f}/{applied:.0%} | rew {rew:+.3f} ep {ep_rew:+.2f} (T{ep_term:+.1f}) "
             f"| eps {episodes:4d} W/L/D {wins:3d}/{losses:3d}/{draws:3d} "
             f"| vs {held.label:9s} "
             f"| alpha {alpha:.2f} | sps {args.envs * args.steps / elapsed:7.0f} | {elapsed:5.1f}s"

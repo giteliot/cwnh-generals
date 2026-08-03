@@ -130,6 +130,40 @@ def test_value_head_cannot_diverge():
         assert abs(float(value)) <= VALUE_SCALE
 
 
+def test_stall_scores_the_same_as_a_draw():
+    """A turn-1200 timeout and a mutual deathtouch are both draws and must be
+    valued identically -- only the income tiebreak may separate them."""
+    from training.potential import Outcome, terminal_reward
+
+    env = GeneralsEnv(mode="competition", pool_size=64)
+    pool, _ = env.reset(jrandom.PRNGKey(0))
+    state = jax.tree.map(lambda x: x[0], pool)
+    o = Outcome()
+    T, F = jnp.bool_(True), jnp.bool_(False)
+
+    stall = float(terminal_reward(jnp.float32(0), F, T, state, 0, o))
+    mutual = float(terminal_reward(jnp.float32(0), T, F, state, 0, o))
+    assert stall == mutual, f"stall {stall} must equal mutual-kill draw {mutual}"
+    assert float(terminal_reward(jnp.float32(0), F, F, state, 0, o)) == 0.0
+
+
+def test_decisive_outcomes_are_zero_sum():
+    """win + loss must be 0. Asymmetric terminals make self-play non-zero-sum,
+    paying BOTH seats jointly for a decisive game -- a known route to degenerate
+    cooperative equilibria."""
+    from training.potential import LOSS, WIN
+    assert WIN + LOSS == 0, f"WIN {WIN} + LOSS {LOSS} != 0"
+
+
+def test_stalling_never_beats_fighting_for_a_competent_agent():
+    """A draw must sit strictly between loss and win, so stalling is never a
+    refuge but throwing the game is never attractive either."""
+    from training.potential import DRAW, LOSS, WIN
+    assert LOSS < DRAW < 0 < WIN
+    breakeven = (DRAW - LOSS) / (WIN - LOSS)
+    assert 0.1 < breakeven < 0.4, f"fight-vs-stall breakeven {breakeven:.0%} is out of range"
+
+
 def test_terminal_reward_dominates_shaping():
     """Winning must be worth more than everything shaping can ever pay out."""
     from training.potential import PHI_BOUND, WIN, Outcome, terminal_reward
@@ -154,4 +188,4 @@ def test_terminal_reward_dominates_shaping():
     assert ongoing == 0.0, "a non-final step must carry no terminal reward"
     assert mutual == drawn, "mutual deathtouch is a draw"
     assert loss < drawn < 0 < win, f"need loss < draw < 0 < win, got {loss} {drawn} {win}"
-    assert abs(loss) < abs(win), "a coin-flip fight should beat a certain draw"
+    assert abs(loss) == abs(win), "decisive outcomes must stay zero-sum"

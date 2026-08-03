@@ -67,17 +67,35 @@ def make_update(apply_fn, config):
 
         ent = jax.vmap(entropy)(logits).mean()
         total = actor_loss + config["VF_COEF"] * value_loss - config["ENT_COEF"] * ent
-        return total, (value_loss, actor_loss, ent)
+
+        # Approximate KL(old || new) via Schulman's k3 estimator -- non-negative
+        # and low-variance, unlike the naive mean(old_lp - new_lp).
+        log_ratio = log_prob - traj.log_prob
+        approx_kl = jnp.mean(jnp.exp(log_ratio) - 1.0 - log_ratio)
+        return total, (value_loss, actor_loss, ent, approx_kl)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
-    def update_minibatch(train_state, batch):
+    def update_minibatch(carry, batch):
+        # Target-KL early stop. One destructive update erased 4000 updates of
+        # progress (upd 4080: value loss spiked 0.4 -> 2.9, two updates later the
+        # policy had collapsed to all-draws and never recovered). Once the policy
+        # has moved more than TARGET_KL from the rollout policy, the remaining
+        # minibatches are no-ops: importance ratios are stale and each further
+        # step is extrapolation. Standard guard in SB3 / Spinning Up PPO.
+        train_state, stop = carry
         traj, advantages, targets = batch
         (total, aux), grads = grad_fn(train_state.params, traj, advantages, targets)
-        return train_state.apply_gradients(grads=grads), (total, *aux)
+        stepped = train_state.apply_gradients(grads=grads)
+        train_state = jax.tree.map(
+            lambda old, new: jnp.where(stop, old, new), train_state, stepped
+        )
+        applied = jnp.where(stop, 0.0, 1.0)
+        stop = stop | (aux[-1] > config["TARGET_KL"])
+        return (train_state, stop), (total, *aux, applied)
 
     def update_epoch(carry, _):
-        train_state, traj, advantages, targets, key = carry
+        train_state, stop, traj, advantages, targets, key = carry
         key, subkey = jax.random.split(key)
         batch_size = config["NUM_STEPS"] * config["NUM_ENVS"]
         permutation = jax.random.permutation(subkey, batch_size)
@@ -87,7 +105,9 @@ def make_update(apply_fn, config):
         minibatches = jax.tree.map(
             lambda x: x.reshape((config["NUM_MINIBATCHES"], -1) + x.shape[1:]), batch
         )
-        train_state, info = jax.lax.scan(update_minibatch, train_state, minibatches)
-        return (train_state, traj, advantages, targets, key), info
+        (train_state, stop), info = jax.lax.scan(
+            update_minibatch, (train_state, stop), minibatches
+        )
+        return (train_state, stop, traj, advantages, targets, key), info
 
     return update_epoch

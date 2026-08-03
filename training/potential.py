@@ -199,7 +199,13 @@ def draw_score(state, p):
 #
 # LOSS is smaller in magnitude than WIN on purpose: it makes a coin-flip fight
 # better in expectation than a certain draw, which is the opposite of the
-# turtling the agent found on its own.
+# turtling the agent found on its own. Fighting beats mutual turtling whenever
+# the policy believes it wins with p > (DRAW - LOSS) / (WIN - LOSS):
+#   LOSS=-6 -> p > 25%     LOSS=-9 -> p > 37%
+# Keep |LOSS| moderate: a harsher loss widens the turtle attractor that a
+# damaged policy falls back into (this is where the upd-4080 collapse landed).
+# These constants are the single source of truth -- train.py's --win/--loss/
+# --draw/--draw-tiebreak flags default to them.
 
 # GAMMA MATTERS AS MUCH AS THESE NUMBERS. A terminal reward T steps away is
 # worth gamma^T at t=0, and episodes run to 1200:
@@ -219,7 +225,7 @@ def draw_score(state, p):
 # better" as a real but small preference, which is the intended semantics.
 
 WIN = 10.0
-LOSS = -9.0
+LOSS = -6.0
 DRAW = -2.0
 DRAW_TIEBREAK = 1.0     # a draw while ahead on income hurts less than one behind
 

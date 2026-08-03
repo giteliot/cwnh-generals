@@ -166,21 +166,46 @@ def pfsp_weights(scores, power):
     return [x / total for x in w]
 
 
-def choose_opponent(args, bank, league, key):
-    """One league, one rule: hard opponents get played until they stop being hard.
+# Cold start: a fresh policy beats nothing, so PFSP -- which prioritises the
+# HARDEST opponent -- points the wrong way, and self-play between two random
+# policies is pure draws with no gradient. A run spent 60% of its first 300
+# updates on self and 10 on RandomAgent, and had zero wins after 1755 updates.
+# AlphaStar avoids this by bootstrapping from behaviour cloning before PFSP
+# takes over; lacking that, bootstrap on the easiest opponent instead.
+BOOTSTRAP_SCORE = 0.5    # once anything is beaten this well, switch to PFSP
 
-    With prob --self-prob the opponent is the LIVE current policy (ML-Agents
-    defaults to 0.5, OpenAI Five goes to 0.8 -- the latest policy is the
-    strongest signal). Otherwise PFSP over {scripted bots} U {bank}. This
-    subsumes the old hand-tuned schedule: unbeaten bots score 0 -> weight 1 ->
-    dominate the non-self half; a bot beaten 95% of the time gets weight
-    0.05^2, i.e. ~400x rarer. Nothing graduates on a timer, only on results.
+
+def bootstrapping(league):
+    scores = [league_score(st) for st in league["bots"].values()]
+    return max(scores, default=0.0) < BOOTSTRAP_SCORE
+
+
+def choose_opponent(args, bank, league, key):
+    """Easy-first until the agent can win, then PFSP hardest-first.
+
+    Normal mode: with prob --self-prob play the LIVE policy (ML-Agents defaults
+    to 0.5, OpenAI Five to 0.8 -- latest is the strongest signal), else PFSP
+    over {bots} U {bank}, weight (1-score)^p. Hard opponents dominate and
+    nothing graduates on a timer, only on results.
+
+    Bootstrap mode (nothing beaten yet): no self-play, and the weighting flips
+    to prefer the opponent we are doing BEST against -- the only one that can
+    produce a first win to learn from.
     """
     k_self, k_pick = jrandom.split(key)
+
+    if bootstrapping(league):
+        scores = [league_score(league["bots"][n]) for n in SCRIPTED]
+        weights = [(s + 0.05) ** args.pfsp_power for s in scores]
+        total = sum(weights)
+        weights = [w / total for w in weights]
+        i = int(jrandom.choice(k_pick, len(SCRIPTED), p=jnp.asarray(weights)))
+        return Opponent(i, SCRIPTED[i], -1)
+
     if float(jrandom.uniform(k_self)) < args.self_prob:
         return Opponent(NETWORK, "self", -1)
 
-    labels = list(SCRIPTED) + [f"bank[{i}]" for i in range(len(bank))]
+    labels = list(SCRIPTED) + [f"bank[{i}]" for i in range(len(league["bank"]))]
     scores = [league_score(league["bots"][n]) for n in SCRIPTED]
     scores += [league_score(st) for st in league["bank"]]
     weights = pfsp_weights(scores, args.pfsp_power)
@@ -191,7 +216,8 @@ def choose_opponent(args, bank, league, key):
 
 
 def league_table(league):
-    cells = [f"{n} {league_score(st):.2f}" for n, st in league["bots"].items()]
+    cells = ["BOOTSTRAP" if bootstrapping(league) else "pfsp"]
+    cells += [f"{n} {league_score(st):.2f}" for n, st in league["bots"].items()]
     cells += [f"b{i} {league_score(st):.2f}" for i, st in enumerate(league["bank"])]
     return "  ".join(cells)
 

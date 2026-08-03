@@ -7,7 +7,7 @@ import jax.random as jrandom
 from generals.agents.agent import Agent
 
 from .actions import decode
-from .features import PLANE_NAMES, extract, init_belief, update_belief
+from .features import PLANE_NAMES, extract, init_belief, record_move, update_belief
 from .masking import action_mask
 from .network import ActorCritic
 
@@ -29,7 +29,23 @@ class PPOAgent(Agent):
         self.player_idx = player_idx
         self.temperature = temperature
         self.belief = None
-        self._forward = jax.jit(self.network.apply)
+
+        # Jit the WHOLE turn, not just the network. update_belief/extract/
+        # action_mask are plain jnp, and extract runs three BFS passes as
+        # lax.fori_loop -- eagerly that is ~130 dispatches per BFS, every turn.
+        # A 10-game eval was taking >20 minutes with the GPU idle because it was
+        # all launch overhead. Fused, it is one kernel launch per turn.
+        def one_turn(params, obs, belief, player, key):
+            belief = update_belief(belief, obs)
+            planes, globals_ = extract(obs, belief, player)
+            logits, _ = self.network.apply(params, planes, globals_, action_mask(obs))
+            # temperature is fixed at construction, so branch in Python
+            index = (jrandom.categorical(key, logits / self.temperature)
+                     if self.temperature > 0 else jnp.argmax(logits))
+            move = decode(index, *obs.armies.shape)
+            return record_move(belief, move), move
+
+        self._act = jax.jit(one_turn)
 
     def reset(self):
         self.belief = None
@@ -37,16 +53,6 @@ class PPOAgent(Agent):
     def act(self, observation, key):
         if self.belief is None:
             self.belief = init_belief(observation.armies.shape)
-        self.belief = update_belief(self.belief, observation)
-
-        planes, globals_ = extract(observation, self.belief, self.player_idx)
-        mask = action_mask(observation)
-        logits, _ = self._forward(self.params, planes, globals_, mask)
-
-        if self.temperature > 0:
-            index = jrandom.categorical(key, logits / self.temperature)
-        else:
-            index = jnp.argmax(logits)
-
-        height, width = observation.armies.shape
-        return decode(index, height, width)
+        self.belief, move = self._act(
+            self.params, observation, self.belief, self.player_idx, key)
+        return move

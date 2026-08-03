@@ -146,7 +146,10 @@ def opponent_mix(p, args):
     else:
         span = max(args.opp_mix_by - args.opp_all_bots, 1e-9)
         scripted = max(0.0, 1.0 - (p - args.opp_all_bots) / span)
-    random_share = max(0.0, 1.0 - p / max(args.opp_no_random, 1e-9))
+    # 0.25 = random's UNIFORM share of four bots. Without the 0.25 this starts
+    # at 1.0, i.e. ~100% RandomAgent, and the whole bootstrap phase is spent on
+    # the one opponent that teaches nothing.
+    random_share = 0.25 * max(0.0, 1.0 - p / max(args.opp_no_random, 1e-9))
     return scripted, random_share
 
 

@@ -132,7 +132,9 @@ def test_value_head_cannot_diverge():
 
 def test_stall_scores_the_same_as_a_draw():
     """A turn-1200 timeout and a mutual deathtouch are both draws and must be
-    valued identically -- only the income tiebreak may separate them."""
+    valued identically, and flat -- nothing about HOW a game timed out may score
+    better than anything else, or a draw-heavy rollout optimises that instead of
+    winning."""
     from training.potential import Outcome, terminal_reward
 
     env = GeneralsEnv(mode="competition", pool_size=64)
@@ -145,6 +147,11 @@ def test_stall_scores_the_same_as_a_draw():
     mutual = float(terminal_reward(jnp.float32(0), T, F, state, 0, o))
     assert stall == mutual, f"stall {stall} must equal mutual-kill draw {mutual}"
     assert float(terminal_reward(jnp.float32(0), F, F, state, 0, o)) == 0.0
+
+    for seed in range(6):
+        for p in (0, 1):
+            other = jax.tree.map(lambda x: x[seed], pool)
+            assert float(terminal_reward(jnp.float32(0), F, T, other, p, o)) == stall
 
 
 def test_decisive_outcomes_are_zero_sum():

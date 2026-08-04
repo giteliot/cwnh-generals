@@ -227,7 +227,7 @@ def draw_score(state, p):
 WIN = 10.0
 LOSS = -10.0
 DRAW = -5.0
-DRAW_TIEBREAK = 1.0     # a draw while ahead on income hurts less than one behind
+DRAW_TIEBREAK = 0.0     # off: see terminal_reward
 
 
 class Outcome(NamedTuple):
@@ -246,9 +246,15 @@ def terminal_reward(raw, terminated, truncated, state, p, outcome=Outcome()):
       terminated, raw != 0   -> someone was decapitated       -> win / loss
       terminated, raw == 0   -> mutual deathtouch             -> draw
       truncated              -> stalled out at turn 1200      -> draw
-    A 1200-turn stall and a mutual kill both land on `drawn`; only the income
-    tiebreak separates them, so a 1-tile turtle scores DRAW - tiebreak while an
-    expander that merely ran out of clock scores DRAW + tiebreak.
+    A 1200-turn stall and a mutual kill both land on `drawn`, flat.
+
+    The income tiebreak is OFF. Shaping is potential-based, so an episode's
+    shaping sums to exactly -PHI(s0) no matter what happened in between -- the
+    terminal is the ONLY thing carrying episode-level variance. When most games
+    time out (98% of a rollout against a passive opponent), the tiebreak is
+    therefore the only signal in the batch, and PPO normalises advantages, so it
+    becomes the whole objective: maximise income at turn 1200. That trains
+    farming, not winning. Flat draws leave the win as the only thing to chase.
 
     Non-final steps return 0.
     """

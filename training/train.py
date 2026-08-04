@@ -11,7 +11,7 @@ import numpy as np
 import optax
 from flax.training.train_state import TrainState
 
-from generals.agents import ExpanderAgent, HunterAgent, RandomAgent
+from generals.agents import ExpanderAgent, HunterAgent
 from generals.agents.harvester_agent import HarvesterAgent
 from generals.core.env import GeneralsEnv
 from generals.core.game import get_observation
@@ -117,28 +117,34 @@ def check_features(blob, path):
         )
 
 
-# Opponent pool. Index 0-3 are scripted, index 4 is a network (current policy
-# or a banked checkpoint). RandomAgent is only used in the opening phase.
-SCRIPTED = ("random", "expander", "hunter", "harvester")
+# Opponent pool. Index 0-2 are scripted, index 3 is a network (current policy
+# or a banked checkpoint).
+#
+# RandomAgent is NOT here. Over 4828 episodes it produced 0.0% wins, 8.1% losses
+# and 91.9% draws: it never dies, because neither side can find a general, and
+# the 8% of losses are it stumbling onto ours. An opponent that cannot lose
+# teaches nothing -- the terminal reward is the only episode-level signal, so a
+# schedule full of timeouts is a schedule with no signal. The remaining three
+# finish 39-82% of their games.
+SCRIPTED = ("expander", "hunter", "harvester")
 NETWORK = len(SCRIPTED)
 
 
 def build_scripted():
-    return [RandomAgent(), ExpanderAgent(), HunterAgent(), HarvesterAgent()]
+    return [ExpanderAgent(), HunterAgent(), HarvesterAgent()]
 
 
 class Opponent(NamedTuple):
-    kind: int          # 0-3 scripted, 4 network
+    kind: int          # 0-2 scripted, 3 network
     label: str
     bank_idx: int      # index into bank, or -1
 
     def one_hot(self):
-        """Identity for the critic: the four bots, self, and bank get distinct
-        slots. Which bank entry does not matter -- what the critic needs is
-        'this game is worth ~+9.8' vs '~-2.6', and all bank entries sit in the
-        same regime."""
-        i = self.kind if self.kind != NETWORK else (NETWORK + (self.bank_idx >= 0))
-        return jnp.eye(NUM_OPPONENT_KINDS, dtype=jnp.float32)[i]
+        """Identity for the critic: each bot gets a slot, all bank entries share
+        one. Which bank entry does not matter -- what the critic needs is 'this
+        game is worth ~+9.8' vs '~-2.6', and every bank entry sits in the same
+        regime. There is no 'self' slot: the live policy is never an opponent."""
+        return jnp.eye(NUM_OPPONENT_KINDS, dtype=jnp.float32)[self.kind]
 
 
 LEAGUE_DECAY = 0.98      # per-update EMA on stats: ~50-update memory, so a
@@ -169,9 +175,15 @@ def pfsp_weights(scores, power):
 # Cold start: a fresh policy beats nothing, so PFSP -- which prioritises the
 # HARDEST opponent -- points the wrong way, and self-play between two random
 # policies is pure draws with no gradient. A run spent 60% of its first 300
-# updates on self and 10 on RandomAgent, and had zero wins after 1755 updates.
-# AlphaStar avoids this by bootstrapping from behaviour cloning before PFSP
-# takes over; lacking that, bootstrap on the easiest opponent instead.
+# updates on self and had zero wins after 1755 updates.
+#
+# "Easiest" is scored by league_score, which counts draws as half a win. With
+# RandomAgent in the pool that ranked it top (0.46, from a 92% draw rate) and
+# poured the cold start into the one opponent that never dies. Dropping it makes
+# the ranking mean what it says: every remaining bot can actually be beaten.
+#
+# AlphaStar avoids this phase entirely by bootstrapping from behaviour cloning
+# before PFSP takes over; lacking that, bootstrap on the easiest opponent.
 BOOTSTRAP_SCORE = 0.5    # once anything is beaten this well, switch to PFSP
 
 
@@ -183,31 +195,41 @@ def bootstrapping(league):
 def choose_opponent(args, bank, league, key):
     """Easy-first until the agent can win, then PFSP hardest-first.
 
-    Normal mode: with prob --self-prob play the LIVE policy (ML-Agents defaults
-    to 0.5, OpenAI Five to 0.8 -- latest is the strongest signal), else PFSP
-    over {bots} U {bank}, weight (1-score)^p. Hard opponents dominate and
-    nothing graduates on a timer, only on results.
+    The opponent is NEVER the live policy. Playing `train_state.params` makes the
+    opponent non-stationary at exactly the learning frequency; ML-Agents never
+    does that -- `play_against_latest_model_ratio` picks between saved SNAPSHOTS
+    and swaps them every `swap_steps`, so the opponent is frozen while you learn
+    against it. A 7900-update run played live-self or bank for 98% of its last
+    600 updates and drifted from 63% to 45% against its own bank.
 
-    Bootstrap mode (nothing beaten yet): no self-play, and the weighting flips
-    to prefer the opponent we are doing BEST against -- the only one that can
-    produce a first win to learn from.
+    Bots keep a floor. PFSP's (1-score)^p correctly stops wasting rollouts on
+    opponents we already beat 100%, but with 10 bank entries near 0.50 it drove
+    expander/hunter/harvester to 10 updates out of 600 -- deleting the only
+    fixed yardstick in the system, so nothing could tell improvement from decay.
+    The floor guarantees one absolute reference roughly every 1/bot_floor updates,
+    and PFSP still decides WHICH bot: the ones we crush stay rare.
+
+    Bootstrap mode (nothing beaten yet): the weighting flips to prefer the
+    opponent we are doing BEST against -- the only one that can produce a first
+    win to learn from.
     """
-    k_self, k_pick = jrandom.split(key)
+    k_floor, k_pick = jrandom.split(key)
+    bot_scores = [league_score(league["bots"][n]) for n in SCRIPTED]
 
     if bootstrapping(league):
-        scores = [league_score(league["bots"][n]) for n in SCRIPTED]
-        weights = [(s + 0.05) ** args.pfsp_power for s in scores]
+        weights = [(s + 0.05) ** args.pfsp_power for s in bot_scores]
         total = sum(weights)
         weights = [w / total for w in weights]
         i = int(jrandom.choice(k_pick, len(SCRIPTED), p=jnp.asarray(weights)))
         return Opponent(i, SCRIPTED[i], -1)
 
-    if float(jrandom.uniform(k_self)) < args.self_prob:
-        return Opponent(NETWORK, "self", -1)
+    if not bank or float(jrandom.uniform(k_floor)) < args.bot_floor:
+        weights = pfsp_weights(bot_scores, args.pfsp_power)
+        i = int(jrandom.choice(k_pick, len(SCRIPTED), p=jnp.asarray(weights)))
+        return Opponent(i, SCRIPTED[i], -1)
 
     labels = list(SCRIPTED) + [f"bank[{i}]" for i in range(len(league["bank"]))]
-    scores = [league_score(league["bots"][n]) for n in SCRIPTED]
-    scores += [league_score(st) for st in league["bank"]]
+    scores = bot_scores + [league_score(st) for st in league["bank"]]
     weights = pfsp_weights(scores, args.pfsp_power)
     i = int(jrandom.choice(k_pick, len(labels), p=jnp.asarray(weights)))
     if i < len(SCRIPTED):
@@ -246,7 +268,10 @@ def make_rollout(env, network, pool, scripted, config):
                 opp_obs, opp_belief, 1 - learner_player
             )
 
-            hot = jnp.broadcast_to(opp_hot, (seat.shape[0], NUM_OPPONENT_KINDS))
+            # width from the caller, not the constant: eval tools load checkpoints
+            # trained with a different NUM_OPPONENT_KINDS and the value head's
+            # input has to match whatever those weights expect.
+            hot = jnp.broadcast_to(opp_hot, (seat.shape[0], opp_hot.shape[-1]))
             logits, value = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
                 params, planes, globals_, mask, hot)
 
@@ -261,8 +286,8 @@ def make_rollout(env, network, pool, scripted, config):
             # lax.switch runs exactly one branch, so a scripted opponent costs no
             # network forward and vice versa. All branches are traced at compile.
             def net_branch(_):
-                o_logits, _ = jax.vmap(network.apply, in_axes=(None, 0, 0, 0))(
-                    opp_params, o_planes, o_globals, o_mask)   # opponent's own value unused
+                o_logits, _ = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
+                    opp_params, o_planes, o_globals, o_mask, hot)   # opponent's own value unused
                 idx = jax.vmap(sample)(o_logits, jrandom.split(k_opp, n))
                 return jax.vmap(decode, in_axes=(0, None, None))(idx, height, width)
 
@@ -324,7 +349,7 @@ def make_rollout(env, network, pool, scripted, config):
         obs1 = jax.vmap(get_observation, in_axes=(0, None))(state, 1)
         learner_obs = jax.vmap(pick)(seat, obs0, obs1)
         _, planes, globals_, mask = jax.vmap(encode_side)(learner_obs, learner_belief, seat.astype(jnp.int32))
-        hot = jnp.broadcast_to(opp_hot, (seat.shape[0], NUM_OPPONENT_KINDS))
+        hot = jnp.broadcast_to(opp_hot, (seat.shape[0], opp_hot.shape[-1]))
         _, last_value = jax.vmap(network.apply, in_axes=(None, 0, 0, 0, 0))(
             params, planes, globals_, mask, hot)
 
@@ -363,11 +388,12 @@ def main():
     parser.add_argument("--opp-swap-every", type=int, default=10)
     parser.add_argument("--pfsp-power", type=float, default=2.0)
     parser.add_argument("--target-kl", type=float, default=0.02)
-    parser.add_argument("--self-prob", type=float, default=0.5)
+    parser.add_argument("--bot-floor", type=float, default=0.15,
+                        help="minimum share of updates played against the scripted bots, "
+                             "so an absolute yardstick never leaves the log")
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--bank-size", type=int, default=10)
     parser.add_argument("--no-stagger", action="store_true")
-    parser.add_argument("--bank-threshold", type=float, default=0.55)
     parser.add_argument("--out", default="ppo_params.pkl")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--reseed", action="store_true")
@@ -493,7 +519,6 @@ def main():
         )
         return carry[0], info
 
-    recent_winrate = []
     held = None
     for update in range(start_update, args.updates):
         t0 = time.time()
@@ -526,8 +551,8 @@ def main():
         # rew: mean reward per env over this rollout (terminal + alpha*shaping).
         # ep:  mean reward per finished episode, 0 when none finished.
         rew = float(traj.reward.sum(axis=0).mean())
-        # Mean TERMINAL value of the episodes that finished (win +10 / loss -6 /
-        # draw -2 +/- tiebreak). Dividing total rollout reward by episode count
+        # Mean cumulative reward of the episodes that finished (win +10 / loss
+        # -10 / draw -5). Dividing total rollout reward by episode count
         # is meaningless when few episodes finish -- it attributes 65k
         # transitions of shaping across 2048 envs to a handful of endings.
         ep_rew = float((ep_return * done).sum()) / episodes if episodes else 0.0
@@ -542,8 +567,6 @@ def main():
         )
 
         if episodes:
-            recent_winrate.append(wins / episodes)
-            recent_winrate[:] = recent_winrate[-20:]
             stats = (league["bots"][held.label] if held.kind != NETWORK
                      else league["bank"][held.bank_idx] if held.bank_idx >= 0 else None)
             if stats is not None:
@@ -551,18 +574,21 @@ def main():
                     stats[j] = LEAGUE_DECAY * stats[j] + v
 
         if (update + 1) % args.checkpoint_every == 0:
-            # Only bank a checkpoint once it is actually beating the pool.
-            # Appending on a fixed timer fills the league with weak versions,
-            # which inflates the training win-rate and stops teaching anything.
-            strong = (len(recent_winrate) >= 10
-                      and sum(recent_winrate) / len(recent_winrate) >= args.bank_threshold)
-            if strong:
-                bank.append(jax.tree.map(jnp.copy, train_state.params))
-                league["bank"].append([0.0, 0.0, 0.0])
-                bank[:] = bank[-args.bank_size:]
-                league["bank"][:] = league["bank"][-args.bank_size:]   # stay aligned
-                recent_winrate.clear()
-                held = None                                    # re-pick vs the new pool
+            # Snapshot on a timer -- ML-Agents `save_steps`. The old gate ("bank
+            # only while beating the pool") measured strength against a pool made
+            # of recent selves, so the bar sank along with the policy and it kept
+            # banking at 45% right through the decline.
+            bank.append(jax.tree.map(jnp.copy, train_state.params))
+            league["bank"].append([0.0, 0.0, 0.0])
+            if len(bank) > args.bank_size:
+                # Evict the entry we beat MOST, never the oldest. FIFO dropped the
+                # peak policy out of the pool and the reference frame then tracked
+                # the decline instead of anchoring against it. A fresh entry has
+                # games < MIN_GAMES so it scores 0.0 and is safe until measured.
+                weakest = max(range(len(bank)), key=lambda j: league_score(league["bank"][j]))
+                bank.pop(weakest)
+                league["bank"].pop(weakest)
+            held = None                                        # re-pick vs the new pool
             print(f"    league: {league_table(league)}")
             save(args.out, train_state, update + 1, bank, league, key, args)
 

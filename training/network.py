@@ -8,7 +8,7 @@ from .actions import NUM_CELL_ACTIONS
 
 NEG_INF = -1e9
 VALUE_SCALE = 20.0       # > max |return| (terminal ~10 + shaping ~1.4); see potential.REWARD_BOUND
-NUM_OPPONENT_KINDS = 6   # random, expander, hunter, harvester, self, bank
+NUM_OPPONENT_KINDS = 4   # expander, hunter, harvester, bank
 
 
 class ResBlock(nn.Module):
@@ -35,8 +35,8 @@ class ActorCritic(nn.Module):
     def __call__(self, planes, globals_, mask, opponent=None):
         """opponent: one-hot over NUM_OPPONENT_KINDS, fed ONLY to the value head.
 
-        Episode return swings ~12 points with who we are playing (+9.8 vs
-        RandomAgent, -2.6 vs a banked checkpoint) while the board looks the
+        Episode return swings ~12 points with who we are playing (+9.8 vs a
+        weak bot, -2.6 vs a banked checkpoint) while the board looks the
         same, so a critic that cannot see the opponent can only learn a blend
         and carries irreducible error -- which poisons the advantages and
         collapsed two runs at update ~4080. Asymmetric actor-critic: the policy

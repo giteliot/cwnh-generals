@@ -16,7 +16,6 @@ from generals.agents.harvester_agent import HarvesterAgent
 from generals.core.env import GeneralsEnv
 from generals.core.game import get_observation
 
-from . import anchors
 from .actions import decode, num_actions
 from .features import (
     GLOBAL_NAMES,
@@ -47,7 +46,7 @@ DEFAULT_CONFIG = dict(
     GAE_LAMBDA=0.95,
     CLIP_EPS=0.2,
     VF_COEF=0.5,
-    ENT_COEF=0.005,
+    ENT_COEF=0.01,
     MAX_GRAD_NORM=0.5,
     UPDATE_EPOCHS=4,
     NUM_MINIBATCHES=8,
@@ -80,7 +79,7 @@ def to_jax(tree):
     return jax.tree.map(jnp.asarray, tree)
 
 
-def save(path, train_state, update, bank, league, key, args, bank_last_added=None):
+def save(path, train_state, update, bank, league, key, args):
     tmp = f"{path}.tmp"
     with open(tmp, "wb") as fh:
         pickle.dump({
@@ -90,12 +89,6 @@ def save(path, train_state, update, bank, league, key, args, bank_last_added=Non
             "update": update,
             "bank": [to_numpy(b) for b in bank],
             "league": league,
-            "bank_last_added": bank_last_added,
-            # Paths only. The anchor weights live in their own files and are
-            # never trained, so copying them into every checkpoint would add
-            # ~700 KB per anchor for nothing -- and would hide the fact that an
-            # anchor is meant to be a file you can point at and diff.
-            "anchors": args.anchors,
             "key": np.asarray(jrandom.key_data(key)),
             "channels": args.channels,
             "blocks": args.blocks,
@@ -144,21 +137,13 @@ def build_scripted():
 class Opponent(NamedTuple):
     kind: int          # 0-2 scripted, 3 network
     label: str
-    bank_idx: int = -1      # index into bank, or -1
-    anchor_idx: int = -1    # index into anchors, or -1
+    bank_idx: int      # index into bank, or -1
 
     def one_hot(self):
         """Identity for the critic: each bot gets a slot, all bank entries share
         one. Which bank entry does not matter -- what the critic needs is 'this
         game is worth ~+9.8' vs '~-2.6', and every bank entry sits in the same
-        regime. There is no 'self' slot: the live policy is never an opponent.
-
-        Anchors share the bank slot for the same reason -- they are frozen
-        networks of comparable strength, so the value regime is the one the bank
-        slot already encodes. It also keeps NUM_OPPONENT_KINDS at 4: widening it
-        changes the value head's input and makes every existing checkpoint
-        unresumable, which is precisely the incompatibility anchors.conform has
-        to repair for ppo_v11."""
+        regime. There is no 'self' slot: the live policy is never an opponent."""
         return jnp.eye(NUM_OPPONENT_KINDS, dtype=jnp.float32)[self.kind]
 
 
@@ -167,23 +152,11 @@ LEAGUE_DECAY = 0.98      # per-update EMA on stats: ~50-update memory, so a
 MIN_GAMES = 20           # below this an opponent counts as unbeaten (score 0)
 
 
-def init_league(bank, anchors=()):
+def init_league(bank):
     return {
         "bots": {name: [0.0, 0.0, 0.0] for name in SCRIPTED},   # wins, draws, games
         "bank": [[0.0, 0.0, 0.0] for _ in bank],
-        # Keyed by name, not position: adding or dropping an anchor must never
-        # shift another anchor's history the way a list index would.
-        "anchors": {a.name: [0.0, 0.0, 0.0] for a in anchors},
     }
-
-
-def sync_anchors(league, anchors):
-    """Add slots for new anchors, keep the history of ones we already measured,
-    drop stats for anchors no longer in the pool so the table cannot show a
-    yardstick that is not being played."""
-    previous = league.get("anchors") or {}
-    league["anchors"] = {a.name: previous.get(a.name, [0.0, 0.0, 0.0]) for a in anchors}
-    return league
 
 
 def league_score(stats):
@@ -219,12 +192,7 @@ def bootstrapping(league):
     return max(scores, default=0.0) < BOOTSTRAP_SCORE
 
 
-def pfsp_pick(key, scores, power):
-    weights = pfsp_weights(scores, power)
-    return int(jrandom.choice(key, len(scores), p=jnp.asarray(weights)))
-
-
-def choose_opponent(args, bank, anchors, league, key):
+def choose_opponent(args, bank, league, key):
     """Easy-first until the agent can win, then PFSP hardest-first.
 
     The opponent is NEVER the live policy. Playing `train_state.params` makes the
@@ -241,20 +209,9 @@ def choose_opponent(args, bank, anchors, league, key):
     The floor guarantees one absolute reference roughly every 1/bot_floor updates,
     and PFSP still decides WHICH bot: the ones we crush stay rare.
 
-    Anchors get their own floor, above the bots. They are the yardstick the bots
-    used to be: frozen checkpoints of real strength whose score can move all run,
-    where the bots saturate near 100% and the bank is pinned at 0.50 by its own
-    eviction rule. See training/anchors.py.
-
-    The three pools draw from EXCLUSIVE slices of the roll, so each floor means
-    what it says. The old code put the bots into the bank's PFSP draw as well,
-    which gave them more than --bot-floor and made the share depend on how many
-    bank entries happened to exist.
-
     Bootstrap mode (nothing beaten yet): the weighting flips to prefer the
     opponent we are doing BEST against -- the only one that can produce a first
-    win to learn from. Anchors stay out of it: a policy that cannot beat expander
-    learns nothing from a finished submission except how to lose.
+    win to learn from.
     """
     k_floor, k_pick = jrandom.split(key)
     bot_scores = [league_score(league["bots"][n]) for n in SCRIPTED]
@@ -264,44 +221,25 @@ def choose_opponent(args, bank, anchors, league, key):
         total = sum(weights)
         weights = [w / total for w in weights]
         i = int(jrandom.choice(k_pick, len(SCRIPTED), p=jnp.asarray(weights)))
-        return Opponent(i, SCRIPTED[i])
+        return Opponent(i, SCRIPTED[i], -1)
 
-    anchor_share = args.anchor_floor if anchors else 0.0
-    # With no bank there is nothing to spend the remainder on, so the bots take
-    # it -- otherwise the roll would fall through to an empty pool.
-    bot_share = args.bot_floor if bank else 1.0 - anchor_share
-    roll = float(jrandom.uniform(k_floor))
+    if not bank or float(jrandom.uniform(k_floor)) < args.bot_floor:
+        weights = pfsp_weights(bot_scores, args.pfsp_power)
+        i = int(jrandom.choice(k_pick, len(SCRIPTED), p=jnp.asarray(weights)))
+        return Opponent(i, SCRIPTED[i], -1)
 
-    if roll < anchor_share:
-        i = pfsp_pick(k_pick, [league_score(league["anchors"][a.name]) for a in anchors],
-                      args.pfsp_power)
-        return Opponent(NETWORK, f"@{anchors[i].name}", anchor_idx=i)
-
-    if roll < anchor_share + bot_share:
-        i = pfsp_pick(k_pick, bot_scores, args.pfsp_power)
-        return Opponent(i, SCRIPTED[i])
-
-    i = pfsp_pick(k_pick, [league_score(st) for st in league["bank"]], args.pfsp_power)
-    return Opponent(NETWORK, f"bank[{i}]", bank_idx=i)
-
-
-def league_stats(league, anchors, opponent):
-    """The stats row this opponent's result belongs in, or None for live self."""
-    if opponent.kind != NETWORK:
-        return league["bots"][opponent.label]
-    if opponent.anchor_idx >= 0:
-        return league["anchors"][anchors[opponent.anchor_idx].name]
-    if opponent.bank_idx >= 0:
-        return league["bank"][opponent.bank_idx]
-    return None
+    labels = list(SCRIPTED) + [f"bank[{i}]" for i in range(len(league["bank"]))]
+    scores = bot_scores + [league_score(st) for st in league["bank"]]
+    weights = pfsp_weights(scores, args.pfsp_power)
+    i = int(jrandom.choice(k_pick, len(labels), p=jnp.asarray(weights)))
+    if i < len(SCRIPTED):
+        return Opponent(i, labels[i], -1)
+    return Opponent(NETWORK, labels[i], i - len(SCRIPTED))
 
 
 def league_table(league):
     cells = ["BOOTSTRAP" if bootstrapping(league) else "pfsp"]
     cells += [f"{n} {league_score(st):.2f}" for n, st in league["bots"].items()]
-    # Anchors last-but-one and marked, so the fixed yardstick reads apart from
-    # the bank entries that churn under it.
-    cells += [f"@{n} {league_score(st):.2f}" for n, st in league.get("anchors", {}).items()]
     cells += [f"b{i} {league_score(st):.2f}" for i, st in enumerate(league["bank"])]
     return "  ".join(cells)
 
@@ -447,52 +385,18 @@ def main():
     parser.add_argument("--w-explore", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--anneal-frac", type=float, default=0.6)
-    parser.add_argument("--alpha-floor", type=float, default=0.0,
-                        help="shaping weight never anneals below this. alpha=0 makes reward "
-                             "exactly zero on ~97%% of transitions (only ~50-85 of 2048 envs "
-                             "finish an episode per rollout); GAE on that is mostly noise, the "
-                             "actor's gradient collapses toward zero, and ENT_COEF has nothing "
-                             "left to oppose it -- entropy climbs unopposed. A small floor keeps "
-                             "a dense per-step signal for credit assignment without letting "
-                             "shaping dominate the outcome the way alpha=0.63 did at 9200")
     parser.add_argument("--opp-swap-every", type=int, default=10)
     parser.add_argument("--pfsp-power", type=float, default=2.0)
     parser.add_argument("--target-kl", type=float, default=0.02)
     parser.add_argument("--bot-floor", type=float, default=0.15,
                         help="minimum share of updates played against the scripted bots, "
                              "so an absolute yardstick never leaves the log")
-    parser.add_argument("--anchors", default=None,
-                        help="comma-separated frozen opponents, each 'path' or 'name=path'. "
-                             "Accepts a .pkl checkpoint, an export .npz or a submission .zip. "
-                             "Never trained, never banked, never evicted")
-    parser.add_argument("--anchor-floor", type=float, default=0.25,
-                        help="share of updates played against the anchors (ignored with none)")
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--bank-size", type=int, default=10)
-    parser.add_argument("--bank-min-gap", type=int, default=0,
-                        help="skip banking a new snapshot until this many updates have passed "
-                             "since the last one was ADMITTED (not evicted). With a small "
-                             "--bank-size, --checkpoint-every alone clusters the kept entries on "
-                             "whatever was recently trained -- near-identical selves a few hundred "
-                             "updates apart. This spaces them out so a small bank still spans "
-                             "meaningfully different points in training, not just the same one "
-                             "sampled repeatedly")
     parser.add_argument("--no-stagger", action="store_true")
-    parser.add_argument("--warmup-updates", type=int, default=40,
-                        help="rollouts to run with NO gradient before training starts, so the "
-                             "clock-staggered opening episodes finish and the state distribution "
-                             "is natural. Env states are not checkpointed, so a resume otherwise "
-                             "trains its first ~25 updates on turn-0 boards labelled turn-650 -- "
-                             "see the warm-up block for the full diagnosis. 0 disables")
     parser.add_argument("--out", default="ppo_params.pkl")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--reseed", action="store_true")
-    parser.add_argument("--reset-optimizer", action="store_true",
-                        help="do NOT restore Adam's moments from the checkpoint. A stale "
-                             "second-moment estimate (nu), scaled to the previous run's "
-                             "gradients, makes the first post-resume steps oversized when the "
-                             "gradient distribution has changed. Trades continuity for Adam "
-                             "re-estimating the scale in the run it is actually in")
     args = parser.parse_args()
 
     config = dict(
@@ -562,11 +466,6 @@ def main():
         jnp.ones((num_actions(height, width),), bool),
         jnp.zeros((NUM_OPPONENT_KINDS,), jnp.float32),
     )
-    # Keep the freshly built tree as the shape reference for anchors. `params`
-    # below is overwritten by --resume, and a resumed checkpoint can itself carry
-    # an old value-head width -- then it would be conforming anchors to the wrong
-    # target. The init is always what the current code expects.
-    reference = jax.tree.map(np.asarray, params)
     blob = None
     if args.resume and os.path.exists(args.resume):
         with open(args.resume, "rb") as fh:
@@ -585,29 +484,12 @@ def main():
     )
     train_state = TrainState.create(apply_fn=network.apply, params=params, tx=tx)
 
-    frozen = anchors.load(args.anchors, reference)
-    for a in frozen:
-        print(f"anchor @{a.name}: {a.path}")
-    anchor_params = [to_jax(a.params) for a in frozen]
-    if not frozen and args.anchors:
-        print("no anchors loaded -- the scripted bots are the only fixed yardstick")
-
     start_update, bank, league = 0, [], None
     if blob is not None:
         start_update = blob.get("update", 0)
         bank = [to_jax(b) for b in blob.get("bank", [])]
         league = blob.get("league")
-        # Adam carries per-parameter running moments (mu, nu). Restoring them is
-        # normally right -- it is what makes a resume continue rather than
-        # re-accelerate from nothing. But `nu` is a second-moment estimate scaled
-        # to the gradients of the OLD run; the first updates after a resume see a
-        # different gradient distribution (fresh env states, a re-picked opponent,
-        # a changed alpha), and a stale `nu` in the denominator turns those into
-        # oversized steps. --reset-optimizer starts the moments at zero instead,
-        # so Adam re-estimates the scale from the run it is actually in. The cost
-        # is Adam's own warm-up: the first few dozen updates take smaller,
-        # bias-corrected steps, which is the safer direction here.
-        if "opt_state" in blob and not args.reset_optimizer:
+        if "opt_state" in blob:
             train_state = train_state.replace(
                 opt_state=to_jax(blob["opt_state"]), step=blob.get("step", 0)
             )
@@ -616,39 +498,13 @@ def main():
         # bad batch at update ~4080 that way. --reseed breaks the replay.
         if "key" in blob and not args.reseed:
             key = jrandom.wrap_key_data(jnp.asarray(blob["key"]))
-    if (not league or sorted(league.get("bots", {})) != sorted(SCRIPTED)
-            or len(league.get("bank", [])) != len(bank)):
-        league = init_league(bank, frozen)   # older checkpoint: everyone starts "unbeaten"
-    else:
-        # Adding anchors to a run in flight must NOT reset the bot and bank
-        # history -- that history is the only thing that stops PFSP from
-        # re-bootstrapping on opponents it already beat.
-        sync_anchors(league, frozen)
-
-    # A resumed checkpoint can carry more bank entries than THIS run's
-    # --bank-size (e.g. cwnh_0805.pkl was saved under --bank-size 10). The
-    # per-checkpoint eviction below only pops ONE entry per admission, gated by
-    # --bank-min-gap -- shrinking 10 down to 2 that way would take ~9 admission
-    # cycles, hundreds or thousands of updates, silently running on the OLD,
-    # larger pool the whole time. Trim once, immediately, to what was actually
-    # asked for.
-    oversized = len(bank) - args.bank_size
-    while len(bank) > args.bank_size:
-        weakest = max(range(len(bank)), key=lambda j: league_score(league["bank"][j]))
-        bank.pop(weakest)
-        league["bank"].pop(weakest)
-    if blob is not None:
-        trimmed = f", trimmed {oversized} -> {args.bank_size}" if oversized > 0 else ""
-        if args.reset_optimizer:
-            opt_note = "RESET (--reset-optimizer)"
-        elif "opt_state" in blob:
-            opt_note = "restored"
-        else:
-            opt_note = "RESET (absent from checkpoint)"
         print(
             f"resumed {args.resume}: update {start_update}/{args.updates}, "
-            f"bank {len(bank)}{trimmed}, optimizer {opt_note}"
+            f"bank {len(bank)}, optimizer {'restored' if 'opt_state' in blob else 'RESET'}"
         )
+    if (not league or sorted(league.get("bots", {})) != sorted(SCRIPTED)
+            or len(league.get("bank", [])) != len(bank)):
+        league = init_league(bank)   # older checkpoint: everyone starts "unbeaten"
 
     rollout = jax.jit(make_rollout(env, network, pool, build_scripted(), config))
     update_epoch = make_update(network.apply, config)
@@ -663,68 +519,11 @@ def main():
         )
         return carry[0], info
 
-    def opponent_params(opponent, train_state):
-        if opponent.anchor_idx >= 0:
-            return anchor_params[opponent.anchor_idx]
-        if opponent.bank_idx >= 0:
-            return bank[opponent.bank_idx]
-        return train_state.params
-
-    # Warm-up: advance the envs with NO gradients until the state distribution is
-    # natural again.
-    #
-    # `states`/`beliefs` are built fresh above and are NOT in the checkpoint, so
-    # every resume begins with 2048 turn-0 boards. The stagger then sets `time` to
-    # a random 0-699 WITHOUT simulating the board forward -- but `time` drives real
-    # features (progress, deathtouch ramp, to_deathtouch, land_tick), so the policy
-    # is told "turn ~650, deathtouch imminent, game 55% over" while looking at an
-    # undeveloped board. That pair never occurs in real play. Deathtouch then fires
-    # at turn 800, deciding those games after 100-200 turns and emitting +-10
-    # terminal rewards that are noise with respect to skill.
-    #
-    # Training on that wrecks a converged policy. The fingerprint was in every
-    # resume log: the FIRST update tripped the KL early-stop (`kl 0.010/52%`) while
-    # every later update read 100% -- a converged policy resuming on in-distribution
-    # data should produce a near-zero gradient, not one big enough to blow through
-    # the trust region. PFSP then made recovery worse, because the dropped scores
-    # sent the damaged policy straight at the hardest opponents.
-    #
-    # An env staggered to turn t plays (800 - t) turns before deathtouch, i.e. up to
-    # 25 updates at 32 turns each. Warming up past that flushes every OOD first
-    # episode before a single gradient is taken.
-    if args.warmup_updates > 0:
-        warm_held, t_warm = None, time.time()
-        for w in range(args.warmup_updates):
-            key, k_roll, k_opp = jrandom.split(key, 3)
-            if warm_held is None or w % max(args.opp_swap_every, 1) == 0:
-                warm_held = choose_opponent(args, bank, frozen, league, k_opp)
-            carry, *_ = rollout(
-                train_state.params, opponent_params(warm_held, train_state),
-                states, beliefs, opp_beliefs, returns_so_far, seat,
-                jnp.int32(warm_held.kind), warm_held.one_hot(),
-                # alpha/w_explore are irrelevant with no gradient, but shaping is
-                # what `returns_so_far` accumulates, so keep them at the values the
-                # first real update will use.
-                float(max(args.alpha_floor, 1.0 - start_update / max(args.updates * args.anneal_frac, 1))),
-                0.0, k_roll,
-            )
-            states, beliefs, opp_beliefs, returns_so_far, _ = carry
-        # League stats are deliberately NOT updated: these outcomes come from the
-        # distorted opening episodes and would poison the PFSP weighting we are
-        # trying to protect.
-        print(f"warm-up: {args.warmup_updates} rollouts, no gradients, "
-              f"{time.time() - t_warm:.0f}s")
-
     held = None
-    # A very negative default, not `start_update`: with --bank-min-gap set on an
-    # existing checkpoint that predates this field, the run should be free to
-    # bank on its very next --checkpoint-every, not wait out a gap measured from
-    # a moment before the flag existed.
-    bank_last_added = blob.get("bank_last_added", -(10**9)) if blob is not None else -(10**9)
     for update in range(start_update, args.updates):
         t0 = time.time()
         progress = update / max(args.updates * args.anneal_frac, 1)
-        alpha = float(max(args.alpha_floor, 1.0 - progress))
+        alpha = float(max(0.0, 1.0 - progress))
         w_explore = float(max(0.0, 0.2 * (1.0 - 3.0 * progress)))
 
         key, k_roll, k_learn, k_opp = jrandom.split(key, 4)
@@ -733,8 +532,8 @@ def main():
         # beating anyone; ML-Agents holds one fixed for ~10k steps for exactly
         # this reason. `held is None` covers the first update after a resume.
         if held is None or update % max(args.opp_swap_every, 1) == 0:
-            held = choose_opponent(args, bank, frozen, league, k_opp)
-        opp_params = opponent_params(held, train_state)
+            held = choose_opponent(args, bank, league, k_opp)
+        opp_params = bank[held.bank_idx] if held.bank_idx >= 0 else train_state.params
 
         carry, traj, last_value, outcome, terminal, ep_return, done = rollout(
             train_state.params, opp_params, states, beliefs, opp_beliefs, returns_so_far, seat,
@@ -763,12 +562,13 @@ def main():
             f"upd {update:5d} | loss {total_loss:+.3f} v {value_loss:.3f} pi {actor_loss:+.3f} "
             f"H {ent:.2f} kl {kl:.3f}/{applied:.0%} | rew {rew:+.3f} ep {ep_rew:+.2f} (T{ep_term:+.1f}) "
             f"| eps {episodes:4d} W/L/D {wins:3d}/{losses:3d}/{draws:3d} "
-            f"| vs {held.label:12s} "
+            f"| vs {held.label:9s} "
             f"| alpha {alpha:.2f} | sps {args.envs * args.steps / elapsed:7.0f} | {elapsed:5.1f}s"
         )
 
         if episodes:
-            stats = league_stats(league, frozen, held)
+            stats = (league["bots"][held.label] if held.kind != NETWORK
+                     else league["bank"][held.bank_idx] if held.bank_idx >= 0 else None)
             if stats is not None:
                 for j, v in enumerate((wins, draws, episodes)):
                     stats[j] = LEAGUE_DECAY * stats[j] + v
@@ -778,25 +578,23 @@ def main():
             # only while beating the pool") measured strength against a pool made
             # of recent selves, so the bar sank along with the policy and it kept
             # banking at 45% right through the decline.
-            if update + 1 - bank_last_added >= args.bank_min_gap:
-                bank.append(jax.tree.map(jnp.copy, train_state.params))
-                league["bank"].append([0.0, 0.0, 0.0])
-                bank_last_added = update + 1
-                # `while`, not `if`: a single append only ever puts bank one over
-                # size, but staying a loop means a --bank-size lowered mid-run
-                # (not just at resume, where the block above already handles it)
-                # still converges in one checkpoint instead of trickling down.
-                while len(bank) > args.bank_size:
-                    # Evict the entry we beat MOST, never the oldest. FIFO dropped the
-                    # peak policy out of the pool and the reference frame then tracked
-                    # the decline instead of anchoring against it. A fresh entry has
-                    # games < MIN_GAMES so it scores 0.0 and is safe until measured.
-                    weakest = max(range(len(bank)), key=lambda j: league_score(league["bank"][j]))
-                    bank.pop(weakest)
-                    league["bank"].pop(weakest)
-                held = None                                    # re-pick vs the new pool
+            bank.append(jax.tree.map(jnp.copy, train_state.params))
+            league["bank"].append([0.0, 0.0, 0.0])
+            # `while`, not `if`: a resumed checkpoint can carry more entries than
+            # THIS run's --bank-size (cwnh_0805.pkl has 10; this run asks for 5).
+            # `if` only pops one per checkpoint -- append 1, evict 1, net zero --
+            # so the bank would sit at its old size forever instead of shrinking.
+            while len(bank) > args.bank_size:
+                # Evict the entry we beat MOST, never the oldest. FIFO dropped the
+                # peak policy out of the pool and the reference frame then tracked
+                # the decline instead of anchoring against it. A fresh entry has
+                # games < MIN_GAMES so it scores 0.0 and is safe until measured.
+                weakest = max(range(len(bank)), key=lambda j: league_score(league["bank"][j]))
+                bank.pop(weakest)
+                league["bank"].pop(weakest)
+            held = None                                        # re-pick vs the new pool
             print(f"    league: {league_table(league)}")
-            save(args.out, train_state, update + 1, bank, league, key, args, bank_last_added)
+            save(args.out, train_state, update + 1, bank, league, key, args)
 
     save(args.out, train_state, args.updates, bank, league, key, args)
     print(f"saved {args.out}")

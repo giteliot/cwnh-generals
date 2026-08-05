@@ -224,9 +224,9 @@ def draw_score(state, p):
 # needed for convergence. gamma near 1 keeps "winning early is marginally
 # better" as a real but small preference, which is the intended semantics.
 
-WIN = 10.0
-LOSS = -10.0
-DRAW = -5.0
+WIN = 2.0
+LOSS = -2.0
+DRAW = -1.0
 DRAW_TIEBREAK = 0.0     # off: see terminal_reward
 
 

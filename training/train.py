@@ -478,9 +478,21 @@ def main():
                              "meaningfully different points in training, not just the same one "
                              "sampled repeatedly")
     parser.add_argument("--no-stagger", action="store_true")
+    parser.add_argument("--warmup-updates", type=int, default=40,
+                        help="rollouts to run with NO gradient before training starts, so the "
+                             "clock-staggered opening episodes finish and the state distribution "
+                             "is natural. Env states are not checkpointed, so a resume otherwise "
+                             "trains its first ~25 updates on turn-0 boards labelled turn-650 -- "
+                             "see the warm-up block for the full diagnosis. 0 disables")
     parser.add_argument("--out", default="ppo_params.pkl")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--reseed", action="store_true")
+    parser.add_argument("--reset-optimizer", action="store_true",
+                        help="do NOT restore Adam's moments from the checkpoint. A stale "
+                             "second-moment estimate (nu), scaled to the previous run's "
+                             "gradients, makes the first post-resume steps oversized when the "
+                             "gradient distribution has changed. Trades continuity for Adam "
+                             "re-estimating the scale in the run it is actually in")
     args = parser.parse_args()
 
     config = dict(
@@ -585,7 +597,17 @@ def main():
         start_update = blob.get("update", 0)
         bank = [to_jax(b) for b in blob.get("bank", [])]
         league = blob.get("league")
-        if "opt_state" in blob:
+        # Adam carries per-parameter running moments (mu, nu). Restoring them is
+        # normally right -- it is what makes a resume continue rather than
+        # re-accelerate from nothing. But `nu` is a second-moment estimate scaled
+        # to the gradients of the OLD run; the first updates after a resume see a
+        # different gradient distribution (fresh env states, a re-picked opponent,
+        # a changed alpha), and a stale `nu` in the denominator turns those into
+        # oversized steps. --reset-optimizer starts the moments at zero instead,
+        # so Adam re-estimates the scale from the run it is actually in. The cost
+        # is Adam's own warm-up: the first few dozen updates take smaller,
+        # bias-corrected steps, which is the safer direction here.
+        if "opt_state" in blob and not args.reset_optimizer:
             train_state = train_state.replace(
                 opt_state=to_jax(blob["opt_state"]), step=blob.get("step", 0)
             )
@@ -617,10 +639,15 @@ def main():
         league["bank"].pop(weakest)
     if blob is not None:
         trimmed = f", trimmed {oversized} -> {args.bank_size}" if oversized > 0 else ""
+        if args.reset_optimizer:
+            opt_note = "RESET (--reset-optimizer)"
+        elif "opt_state" in blob:
+            opt_note = "restored"
+        else:
+            opt_note = "RESET (absent from checkpoint)"
         print(
             f"resumed {args.resume}: update {start_update}/{args.updates}, "
-            f"bank {len(bank)}{trimmed}, "
-            f"optimizer {'restored' if 'opt_state' in blob else 'RESET'}"
+            f"bank {len(bank)}{trimmed}, optimizer {opt_note}"
         )
 
     rollout = jax.jit(make_rollout(env, network, pool, build_scripted(), config))
@@ -635,6 +662,58 @@ def main():
             None, config["UPDATE_EPOCHS"],
         )
         return carry[0], info
+
+    def opponent_params(opponent, train_state):
+        if opponent.anchor_idx >= 0:
+            return anchor_params[opponent.anchor_idx]
+        if opponent.bank_idx >= 0:
+            return bank[opponent.bank_idx]
+        return train_state.params
+
+    # Warm-up: advance the envs with NO gradients until the state distribution is
+    # natural again.
+    #
+    # `states`/`beliefs` are built fresh above and are NOT in the checkpoint, so
+    # every resume begins with 2048 turn-0 boards. The stagger then sets `time` to
+    # a random 0-699 WITHOUT simulating the board forward -- but `time` drives real
+    # features (progress, deathtouch ramp, to_deathtouch, land_tick), so the policy
+    # is told "turn ~650, deathtouch imminent, game 55% over" while looking at an
+    # undeveloped board. That pair never occurs in real play. Deathtouch then fires
+    # at turn 800, deciding those games after 100-200 turns and emitting +-10
+    # terminal rewards that are noise with respect to skill.
+    #
+    # Training on that wrecks a converged policy. The fingerprint was in every
+    # resume log: the FIRST update tripped the KL early-stop (`kl 0.010/52%`) while
+    # every later update read 100% -- a converged policy resuming on in-distribution
+    # data should produce a near-zero gradient, not one big enough to blow through
+    # the trust region. PFSP then made recovery worse, because the dropped scores
+    # sent the damaged policy straight at the hardest opponents.
+    #
+    # An env staggered to turn t plays (800 - t) turns before deathtouch, i.e. up to
+    # 25 updates at 32 turns each. Warming up past that flushes every OOD first
+    # episode before a single gradient is taken.
+    if args.warmup_updates > 0:
+        warm_held, t_warm = None, time.time()
+        for w in range(args.warmup_updates):
+            key, k_roll, k_opp = jrandom.split(key, 3)
+            if warm_held is None or w % max(args.opp_swap_every, 1) == 0:
+                warm_held = choose_opponent(args, bank, frozen, league, k_opp)
+            carry, *_ = rollout(
+                train_state.params, opponent_params(warm_held, train_state),
+                states, beliefs, opp_beliefs, returns_so_far, seat,
+                jnp.int32(warm_held.kind), warm_held.one_hot(),
+                # alpha/w_explore are irrelevant with no gradient, but shaping is
+                # what `returns_so_far` accumulates, so keep them at the values the
+                # first real update will use.
+                float(max(args.alpha_floor, 1.0 - start_update / max(args.updates * args.anneal_frac, 1))),
+                0.0, k_roll,
+            )
+            states, beliefs, opp_beliefs, returns_so_far, _ = carry
+        # League stats are deliberately NOT updated: these outcomes come from the
+        # distorted opening episodes and would poison the PFSP weighting we are
+        # trying to protect.
+        print(f"warm-up: {args.warmup_updates} rollouts, no gradients, "
+              f"{time.time() - t_warm:.0f}s")
 
     held = None
     # A very negative default, not `start_update`: with --bank-min-gap set on an
@@ -655,12 +734,7 @@ def main():
         # this reason. `held is None` covers the first update after a resume.
         if held is None or update % max(args.opp_swap_every, 1) == 0:
             held = choose_opponent(args, bank, frozen, league, k_opp)
-        if held.anchor_idx >= 0:
-            opp_params = anchor_params[held.anchor_idx]
-        elif held.bank_idx >= 0:
-            opp_params = bank[held.bank_idx]
-        else:
-            opp_params = train_state.params
+        opp_params = opponent_params(held, train_state)
 
         carry, traj, last_value, outcome, terminal, ep_return, done = rollout(
             train_state.params, opp_params, states, beliefs, opp_beliefs, returns_so_far, seat,

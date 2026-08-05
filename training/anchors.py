@@ -28,6 +28,7 @@ from typing import NamedTuple
 
 import numpy as np
 
+from .features import GLOBAL_NAMES, PLANE_NAMES
 from .network import NUM_OPPONENT_KINDS
 
 VALUE_HEAD = "Dense_2"   # nn.Dense call order in ActorCritic: globals, pass_logit, VALUE, value_out
@@ -66,6 +67,20 @@ def read_params(path):
             blob = pickle.load(fh)
         if "params" not in blob:
             raise SystemExit(f"{path} is a pickle with no 'params' key -- not a checkpoint")
+        # A checkpoint records its observation layout, so prefer .pkl over .npz
+        # for an anchor: shape checks catch a changed plane COUNT, but only these
+        # names catch planes that were reordered or repurposed at the same count,
+        # which would load clean and play nonsense.
+        for field, current in (("planes", PLANE_NAMES), ("globals", GLOBAL_NAMES)):
+            saved = blob.get(field)
+            if saved is not None and saved != current:
+                raise SystemExit(
+                    f"{path} was trained with different {field} than the code now builds.\n"
+                    f"  added since:   {[p for p in current if p not in saved] or 'none'}\n"
+                    f"  removed since: {[p for p in saved if p not in current] or 'none'}\n"
+                    f"  reordered:     {saved != current and sorted(saved) == sorted(current)}\n"
+                    "Its observation no longer means what the code feeds it; it cannot be an anchor."
+                )
         return {"params": blob["params"]["params"]}
     if ext == ".npz":
         with open(path, "rb") as fh:

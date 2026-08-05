@@ -446,6 +446,14 @@ def main():
     parser.add_argument("--w-explore", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--anneal-frac", type=float, default=0.6)
+    parser.add_argument("--alpha-floor", type=float, default=0.0,
+                        help="shaping weight never anneals below this. alpha=0 makes reward "
+                             "exactly zero on ~97%% of transitions (only ~50-85 of 2048 envs "
+                             "finish an episode per rollout); GAE on that is mostly noise, the "
+                             "actor's gradient collapses toward zero, and ENT_COEF has nothing "
+                             "left to oppose it -- entropy climbs unopposed. A small floor keeps "
+                             "a dense per-step signal for credit assignment without letting "
+                             "shaping dominate the outcome the way alpha=0.63 did at 9200")
     parser.add_argument("--opp-swap-every", type=int, default=10)
     parser.add_argument("--pfsp-power", type=float, default=2.0)
     parser.add_argument("--target-kl", type=float, default=0.02)
@@ -607,7 +615,7 @@ def main():
     for update in range(start_update, args.updates):
         t0 = time.time()
         progress = update / max(args.updates * args.anneal_frac, 1)
-        alpha = float(max(0.0, 1.0 - progress))
+        alpha = float(max(args.alpha_floor, 1.0 - progress))
         w_explore = float(max(0.0, 0.2 * (1.0 - 3.0 * progress)))
 
         key, k_roll, k_learn, k_opp = jrandom.split(key, 4)

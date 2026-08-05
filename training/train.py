@@ -80,7 +80,7 @@ def to_jax(tree):
     return jax.tree.map(jnp.asarray, tree)
 
 
-def save(path, train_state, update, bank, league, key, args):
+def save(path, train_state, update, bank, league, key, args, bank_last_added=None):
     tmp = f"{path}.tmp"
     with open(tmp, "wb") as fh:
         pickle.dump({
@@ -90,6 +90,7 @@ def save(path, train_state, update, bank, league, key, args):
             "update": update,
             "bank": [to_numpy(b) for b in bank],
             "league": league,
+            "bank_last_added": bank_last_added,
             # Paths only. The anchor weights live in their own files and are
             # never trained, so copying them into every checkpoint would add
             # ~700 KB per anchor for nothing -- and would hide the fact that an
@@ -468,6 +469,14 @@ def main():
                         help="share of updates played against the anchors (ignored with none)")
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--bank-size", type=int, default=10)
+    parser.add_argument("--bank-min-gap", type=int, default=0,
+                        help="skip banking a new snapshot until this many updates have passed "
+                             "since the last one was ADMITTED (not evicted). With a small "
+                             "--bank-size, --checkpoint-every alone clusters the kept entries on "
+                             "whatever was recently trained -- near-identical selves a few hundred "
+                             "updates apart. This spaces them out so a small bank still spans "
+                             "meaningfully different points in training, not just the same one "
+                             "sampled repeatedly")
     parser.add_argument("--no-stagger", action="store_true")
     parser.add_argument("--out", default="ppo_params.pkl")
     parser.add_argument("--resume", default=None)
@@ -612,6 +621,11 @@ def main():
         return carry[0], info
 
     held = None
+    # A very negative default, not `start_update`: with --bank-min-gap set on an
+    # existing checkpoint that predates this field, the run should be free to
+    # bank on its very next --checkpoint-every, not wait out a gap measured from
+    # a moment before the flag existed.
+    bank_last_added = blob.get("bank_last_added", -(10**9)) if blob is not None else -(10**9)
     for update in range(start_update, args.updates):
         t0 = time.time()
         progress = update / max(args.updates * args.anneal_frac, 1)
@@ -674,19 +688,21 @@ def main():
             # only while beating the pool") measured strength against a pool made
             # of recent selves, so the bar sank along with the policy and it kept
             # banking at 45% right through the decline.
-            bank.append(jax.tree.map(jnp.copy, train_state.params))
-            league["bank"].append([0.0, 0.0, 0.0])
-            if len(bank) > args.bank_size:
-                # Evict the entry we beat MOST, never the oldest. FIFO dropped the
-                # peak policy out of the pool and the reference frame then tracked
-                # the decline instead of anchoring against it. A fresh entry has
-                # games < MIN_GAMES so it scores 0.0 and is safe until measured.
-                weakest = max(range(len(bank)), key=lambda j: league_score(league["bank"][j]))
-                bank.pop(weakest)
-                league["bank"].pop(weakest)
-            held = None                                        # re-pick vs the new pool
+            if update + 1 - bank_last_added >= args.bank_min_gap:
+                bank.append(jax.tree.map(jnp.copy, train_state.params))
+                league["bank"].append([0.0, 0.0, 0.0])
+                bank_last_added = update + 1
+                if len(bank) > args.bank_size:
+                    # Evict the entry we beat MOST, never the oldest. FIFO dropped the
+                    # peak policy out of the pool and the reference frame then tracked
+                    # the decline instead of anchoring against it. A fresh entry has
+                    # games < MIN_GAMES so it scores 0.0 and is safe until measured.
+                    weakest = max(range(len(bank)), key=lambda j: league_score(league["bank"][j]))
+                    bank.pop(weakest)
+                    league["bank"].pop(weakest)
+                held = None                                    # re-pick vs the new pool
             print(f"    league: {league_table(league)}")
-            save(args.out, train_state, update + 1, bank, league, key, args)
+            save(args.out, train_state, update + 1, bank, league, key, args, bank_last_added)
 
     save(args.out, train_state, args.updates, bank, league, key, args)
     print(f"saved {args.out}")

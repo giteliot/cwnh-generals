@@ -16,6 +16,7 @@ from generals.agents.harvester_agent import HarvesterAgent
 from generals.core.env import GeneralsEnv
 from generals.core.game import get_observation
 
+from . import anchors
 from .actions import decode, num_actions
 from .features import (
     GLOBAL_NAMES,
@@ -89,6 +90,11 @@ def save(path, train_state, update, bank, league, key, args):
             "update": update,
             "bank": [to_numpy(b) for b in bank],
             "league": league,
+            # Paths only. The anchor weights live in their own files and are
+            # never trained, so copying them into every checkpoint would add
+            # ~700 KB per anchor for nothing -- and would hide the fact that an
+            # anchor is meant to be a file you can point at and diff.
+            "anchors": args.anchors,
             "key": np.asarray(jrandom.key_data(key)),
             "channels": args.channels,
             "blocks": args.blocks,
@@ -137,13 +143,21 @@ def build_scripted():
 class Opponent(NamedTuple):
     kind: int          # 0-2 scripted, 3 network
     label: str
-    bank_idx: int      # index into bank, or -1
+    bank_idx: int = -1      # index into bank, or -1
+    anchor_idx: int = -1    # index into anchors, or -1
 
     def one_hot(self):
         """Identity for the critic: each bot gets a slot, all bank entries share
         one. Which bank entry does not matter -- what the critic needs is 'this
         game is worth ~+9.8' vs '~-2.6', and every bank entry sits in the same
-        regime. There is no 'self' slot: the live policy is never an opponent."""
+        regime. There is no 'self' slot: the live policy is never an opponent.
+
+        Anchors share the bank slot for the same reason -- they are frozen
+        networks of comparable strength, so the value regime is the one the bank
+        slot already encodes. It also keeps NUM_OPPONENT_KINDS at 4: widening it
+        changes the value head's input and makes every existing checkpoint
+        unresumable, which is precisely the incompatibility anchors.conform has
+        to repair for ppo_v11."""
         return jnp.eye(NUM_OPPONENT_KINDS, dtype=jnp.float32)[self.kind]
 
 
@@ -152,11 +166,23 @@ LEAGUE_DECAY = 0.98      # per-update EMA on stats: ~50-update memory, so a
 MIN_GAMES = 20           # below this an opponent counts as unbeaten (score 0)
 
 
-def init_league(bank):
+def init_league(bank, anchors=()):
     return {
         "bots": {name: [0.0, 0.0, 0.0] for name in SCRIPTED},   # wins, draws, games
         "bank": [[0.0, 0.0, 0.0] for _ in bank],
+        # Keyed by name, not position: adding or dropping an anchor must never
+        # shift another anchor's history the way a list index would.
+        "anchors": {a.name: [0.0, 0.0, 0.0] for a in anchors},
     }
+
+
+def sync_anchors(league, anchors):
+    """Add slots for new anchors, keep the history of ones we already measured,
+    drop stats for anchors no longer in the pool so the table cannot show a
+    yardstick that is not being played."""
+    previous = league.get("anchors") or {}
+    league["anchors"] = {a.name: previous.get(a.name, [0.0, 0.0, 0.0]) for a in anchors}
+    return league
 
 
 def league_score(stats):
@@ -192,7 +218,12 @@ def bootstrapping(league):
     return max(scores, default=0.0) < BOOTSTRAP_SCORE
 
 
-def choose_opponent(args, bank, league, key):
+def pfsp_pick(key, scores, power):
+    weights = pfsp_weights(scores, power)
+    return int(jrandom.choice(key, len(scores), p=jnp.asarray(weights)))
+
+
+def choose_opponent(args, bank, anchors, league, key):
     """Easy-first until the agent can win, then PFSP hardest-first.
 
     The opponent is NEVER the live policy. Playing `train_state.params` makes the
@@ -209,9 +240,20 @@ def choose_opponent(args, bank, league, key):
     The floor guarantees one absolute reference roughly every 1/bot_floor updates,
     and PFSP still decides WHICH bot: the ones we crush stay rare.
 
+    Anchors get their own floor, above the bots. They are the yardstick the bots
+    used to be: frozen checkpoints of real strength whose score can move all run,
+    where the bots saturate near 100% and the bank is pinned at 0.50 by its own
+    eviction rule. See training/anchors.py.
+
+    The three pools draw from EXCLUSIVE slices of the roll, so each floor means
+    what it says. The old code put the bots into the bank's PFSP draw as well,
+    which gave them more than --bot-floor and made the share depend on how many
+    bank entries happened to exist.
+
     Bootstrap mode (nothing beaten yet): the weighting flips to prefer the
     opponent we are doing BEST against -- the only one that can produce a first
-    win to learn from.
+    win to learn from. Anchors stay out of it: a policy that cannot beat expander
+    learns nothing from a finished submission except how to lose.
     """
     k_floor, k_pick = jrandom.split(key)
     bot_scores = [league_score(league["bots"][n]) for n in SCRIPTED]
@@ -221,25 +263,44 @@ def choose_opponent(args, bank, league, key):
         total = sum(weights)
         weights = [w / total for w in weights]
         i = int(jrandom.choice(k_pick, len(SCRIPTED), p=jnp.asarray(weights)))
-        return Opponent(i, SCRIPTED[i], -1)
+        return Opponent(i, SCRIPTED[i])
 
-    if not bank or float(jrandom.uniform(k_floor)) < args.bot_floor:
-        weights = pfsp_weights(bot_scores, args.pfsp_power)
-        i = int(jrandom.choice(k_pick, len(SCRIPTED), p=jnp.asarray(weights)))
-        return Opponent(i, SCRIPTED[i], -1)
+    anchor_share = args.anchor_floor if anchors else 0.0
+    # With no bank there is nothing to spend the remainder on, so the bots take
+    # it -- otherwise the roll would fall through to an empty pool.
+    bot_share = args.bot_floor if bank else 1.0 - anchor_share
+    roll = float(jrandom.uniform(k_floor))
 
-    labels = list(SCRIPTED) + [f"bank[{i}]" for i in range(len(league["bank"]))]
-    scores = bot_scores + [league_score(st) for st in league["bank"]]
-    weights = pfsp_weights(scores, args.pfsp_power)
-    i = int(jrandom.choice(k_pick, len(labels), p=jnp.asarray(weights)))
-    if i < len(SCRIPTED):
-        return Opponent(i, labels[i], -1)
-    return Opponent(NETWORK, labels[i], i - len(SCRIPTED))
+    if roll < anchor_share:
+        i = pfsp_pick(k_pick, [league_score(league["anchors"][a.name]) for a in anchors],
+                      args.pfsp_power)
+        return Opponent(NETWORK, f"@{anchors[i].name}", anchor_idx=i)
+
+    if roll < anchor_share + bot_share:
+        i = pfsp_pick(k_pick, bot_scores, args.pfsp_power)
+        return Opponent(i, SCRIPTED[i])
+
+    i = pfsp_pick(k_pick, [league_score(st) for st in league["bank"]], args.pfsp_power)
+    return Opponent(NETWORK, f"bank[{i}]", bank_idx=i)
+
+
+def league_stats(league, anchors, opponent):
+    """The stats row this opponent's result belongs in, or None for live self."""
+    if opponent.kind != NETWORK:
+        return league["bots"][opponent.label]
+    if opponent.anchor_idx >= 0:
+        return league["anchors"][anchors[opponent.anchor_idx].name]
+    if opponent.bank_idx >= 0:
+        return league["bank"][opponent.bank_idx]
+    return None
 
 
 def league_table(league):
     cells = ["BOOTSTRAP" if bootstrapping(league) else "pfsp"]
     cells += [f"{n} {league_score(st):.2f}" for n, st in league["bots"].items()]
+    # Anchors last-but-one and marked, so the fixed yardstick reads apart from
+    # the bank entries that churn under it.
+    cells += [f"@{n} {league_score(st):.2f}" for n, st in league.get("anchors", {}).items()]
     cells += [f"b{i} {league_score(st):.2f}" for i, st in enumerate(league["bank"])]
     return "  ".join(cells)
 
@@ -391,6 +452,12 @@ def main():
     parser.add_argument("--bot-floor", type=float, default=0.15,
                         help="minimum share of updates played against the scripted bots, "
                              "so an absolute yardstick never leaves the log")
+    parser.add_argument("--anchors", default=None,
+                        help="comma-separated frozen opponents, each 'path' or 'name=path'. "
+                             "Accepts a .pkl checkpoint, an export .npz or a submission .zip. "
+                             "Never trained, never banked, never evicted")
+    parser.add_argument("--anchor-floor", type=float, default=0.25,
+                        help="share of updates played against the anchors (ignored with none)")
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--bank-size", type=int, default=10)
     parser.add_argument("--no-stagger", action="store_true")
@@ -466,6 +533,11 @@ def main():
         jnp.ones((num_actions(height, width),), bool),
         jnp.zeros((NUM_OPPONENT_KINDS,), jnp.float32),
     )
+    # Keep the freshly built tree as the shape reference for anchors. `params`
+    # below is overwritten by --resume, and a resumed checkpoint can itself carry
+    # an old value-head width -- then it would be conforming anchors to the wrong
+    # target. The init is always what the current code expects.
+    reference = jax.tree.map(np.asarray, params)
     blob = None
     if args.resume and os.path.exists(args.resume):
         with open(args.resume, "rb") as fh:
@@ -483,6 +555,13 @@ def main():
         optax.adam(config["LR"], eps=1e-5),
     )
     train_state = TrainState.create(apply_fn=network.apply, params=params, tx=tx)
+
+    frozen = anchors.load(args.anchors, reference)
+    for a in frozen:
+        print(f"anchor @{a.name}: {a.path}")
+    anchor_params = [to_jax(a.params) for a in frozen]
+    if not frozen and args.anchors:
+        print("no anchors loaded -- the scripted bots are the only fixed yardstick")
 
     start_update, bank, league = 0, [], None
     if blob is not None:
@@ -504,7 +583,12 @@ def main():
         )
     if (not league or sorted(league.get("bots", {})) != sorted(SCRIPTED)
             or len(league.get("bank", [])) != len(bank)):
-        league = init_league(bank)   # older checkpoint: everyone starts "unbeaten"
+        league = init_league(bank, frozen)   # older checkpoint: everyone starts "unbeaten"
+    else:
+        # Adding anchors to a run in flight must NOT reset the bot and bank
+        # history -- that history is the only thing that stops PFSP from
+        # re-bootstrapping on opponents it already beat.
+        sync_anchors(league, frozen)
 
     rollout = jax.jit(make_rollout(env, network, pool, build_scripted(), config))
     update_epoch = make_update(network.apply, config)
@@ -532,8 +616,13 @@ def main():
         # beating anyone; ML-Agents holds one fixed for ~10k steps for exactly
         # this reason. `held is None` covers the first update after a resume.
         if held is None or update % max(args.opp_swap_every, 1) == 0:
-            held = choose_opponent(args, bank, league, k_opp)
-        opp_params = bank[held.bank_idx] if held.bank_idx >= 0 else train_state.params
+            held = choose_opponent(args, bank, frozen, league, k_opp)
+        if held.anchor_idx >= 0:
+            opp_params = anchor_params[held.anchor_idx]
+        elif held.bank_idx >= 0:
+            opp_params = bank[held.bank_idx]
+        else:
+            opp_params = train_state.params
 
         carry, traj, last_value, outcome, terminal, ep_return, done = rollout(
             train_state.params, opp_params, states, beliefs, opp_beliefs, returns_so_far, seat,
@@ -562,13 +651,12 @@ def main():
             f"upd {update:5d} | loss {total_loss:+.3f} v {value_loss:.3f} pi {actor_loss:+.3f} "
             f"H {ent:.2f} kl {kl:.3f}/{applied:.0%} | rew {rew:+.3f} ep {ep_rew:+.2f} (T{ep_term:+.1f}) "
             f"| eps {episodes:4d} W/L/D {wins:3d}/{losses:3d}/{draws:3d} "
-            f"| vs {held.label:9s} "
+            f"| vs {held.label:12s} "
             f"| alpha {alpha:.2f} | sps {args.envs * args.steps / elapsed:7.0f} | {elapsed:5.1f}s"
         )
 
         if episodes:
-            stats = (league["bots"][held.label] if held.kind != NETWORK
-                     else league["bank"][held.bank_idx] if held.bank_idx >= 0 else None)
+            stats = league_stats(league, frozen, held)
             if stats is not None:
                 for j, v in enumerate((wins, draws, episodes)):
                     stats[j] = LEAGUE_DECAY * stats[j] + v

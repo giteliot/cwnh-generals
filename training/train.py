@@ -594,10 +594,6 @@ def main():
         # bad batch at update ~4080 that way. --reseed breaks the replay.
         if "key" in blob and not args.reseed:
             key = jrandom.wrap_key_data(jnp.asarray(blob["key"]))
-        print(
-            f"resumed {args.resume}: update {start_update}/{args.updates}, "
-            f"bank {len(bank)}, optimizer {'restored' if 'opt_state' in blob else 'RESET'}"
-        )
     if (not league or sorted(league.get("bots", {})) != sorted(SCRIPTED)
             or len(league.get("bank", [])) != len(bank)):
         league = init_league(bank, frozen)   # older checkpoint: everyone starts "unbeaten"
@@ -606,6 +602,26 @@ def main():
         # history -- that history is the only thing that stops PFSP from
         # re-bootstrapping on opponents it already beat.
         sync_anchors(league, frozen)
+
+    # A resumed checkpoint can carry more bank entries than THIS run's
+    # --bank-size (e.g. cwnh_0805.pkl was saved under --bank-size 10). The
+    # per-checkpoint eviction below only pops ONE entry per admission, gated by
+    # --bank-min-gap -- shrinking 10 down to 2 that way would take ~9 admission
+    # cycles, hundreds or thousands of updates, silently running on the OLD,
+    # larger pool the whole time. Trim once, immediately, to what was actually
+    # asked for.
+    oversized = len(bank) - args.bank_size
+    while len(bank) > args.bank_size:
+        weakest = max(range(len(bank)), key=lambda j: league_score(league["bank"][j]))
+        bank.pop(weakest)
+        league["bank"].pop(weakest)
+    if blob is not None:
+        trimmed = f", trimmed {oversized} -> {args.bank_size}" if oversized > 0 else ""
+        print(
+            f"resumed {args.resume}: update {start_update}/{args.updates}, "
+            f"bank {len(bank)}{trimmed}, "
+            f"optimizer {'restored' if 'opt_state' in blob else 'RESET'}"
+        )
 
     rollout = jax.jit(make_rollout(env, network, pool, build_scripted(), config))
     update_epoch = make_update(network.apply, config)
@@ -692,7 +708,11 @@ def main():
                 bank.append(jax.tree.map(jnp.copy, train_state.params))
                 league["bank"].append([0.0, 0.0, 0.0])
                 bank_last_added = update + 1
-                if len(bank) > args.bank_size:
+                # `while`, not `if`: a single append only ever puts bank one over
+                # size, but staying a loop means a --bank-size lowered mid-run
+                # (not just at resume, where the block above already handles it)
+                # still converges in one checkpoint instead of trickling down.
+                while len(bank) > args.bank_size:
                     # Evict the entry we beat MOST, never the oldest. FIFO dropped the
                     # peak policy out of the pool and the reference frame then tracked
                     # the decline instead of anchoring against it. A fresh entry has

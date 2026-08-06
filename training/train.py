@@ -16,6 +16,7 @@ from generals.agents.harvester_agent import HarvesterAgent
 from generals.core.env import GeneralsEnv
 from generals.core.game import get_observation
 
+from . import anchors
 from .actions import decode, num_actions
 from .features import (
     GLOBAL_NAMES,
@@ -89,6 +90,11 @@ def save(path, train_state, update, bank, league, key, args):
             "update": update,
             "bank": [to_numpy(b) for b in bank],
             "league": league,
+            # Paths only. The anchor weights live in their own files and are
+            # never trained, so copying them into every checkpoint would add
+            # their full size for nothing -- and would hide the fact that an
+            # anchor is meant to be a file you can point at and diff.
+            "anchors": args.anchors,
             "key": np.asarray(jrandom.key_data(key)),
             "channels": args.channels,
             "blocks": args.blocks,
@@ -137,13 +143,17 @@ def build_scripted():
 class Opponent(NamedTuple):
     kind: int          # 0-2 scripted, 3 network
     label: str
-    bank_idx: int      # index into bank, or -1
+    bank_idx: int = -1      # index into bank, or -1
+    anchor_idx: int = -1    # index into anchors, or -1
 
     def one_hot(self):
-        """Identity for the critic: each bot gets a slot, all bank entries share
-        one. Which bank entry does not matter -- what the critic needs is 'this
-        game is worth ~+9.8' vs '~-2.6', and every bank entry sits in the same
-        regime. There is no 'self' slot: the live policy is never an opponent."""
+        """Identity for the critic: each bot gets a slot; bank, anchors and
+        self-play all share one. Which specific one does not matter -- what the
+        critic needs is 'this game is worth ~+9.8' vs '~-2.6', and self-play sits
+        in the same peer-level regime as a bank snapshot (this policy, or a very
+        recent one, on both sides). An anchor is deliberately NOT distinguished
+        from bank either: both are frozen/near-frozen opponents of comparable
+        strength to what the bank already encodes."""
         return jnp.eye(NUM_OPPONENT_KINDS, dtype=jnp.float32)[self.kind]
 
 
@@ -152,11 +162,23 @@ LEAGUE_DECAY = 0.98      # per-update EMA on stats: ~50-update memory, so a
 MIN_GAMES = 20           # below this an opponent counts as unbeaten (score 0)
 
 
-def init_league(bank):
+def init_league(bank, anchors=()):
     return {
         "bots": {name: [0.0, 0.0, 0.0] for name in SCRIPTED},   # wins, draws, games
         "bank": [[0.0, 0.0, 0.0] for _ in bank],
+        # Keyed by name, not position: adding or dropping an anchor must never
+        # shift another anchor's history the way a list index would.
+        "anchors": {a.name: [0.0, 0.0, 0.0] for a in anchors},
     }
+
+
+def sync_anchors(league, anchors):
+    """Add slots for new anchors, keep the history of ones already measured,
+    drop stats for anchors no longer in the pool so the table cannot show a
+    yardstick that is not being played."""
+    previous = league.get("anchors") or {}
+    league["anchors"] = {a.name: previous.get(a.name, [0.0, 0.0, 0.0]) for a in anchors}
+    return league
 
 
 def league_score(stats):
@@ -192,54 +214,93 @@ def bootstrapping(league):
     return max(scores, default=0.0) < BOOTSTRAP_SCORE
 
 
-def choose_opponent(args, bank, league, key):
-    """Easy-first until the agent can win, then PFSP hardest-first.
+def pfsp_pick(key, scores, power):
+    weights = pfsp_weights(scores, power)
+    return int(jrandom.choice(key, len(scores), p=jnp.asarray(weights)))
 
-    The opponent is NEVER the live policy. Playing `train_state.params` makes the
-    opponent non-stationary at exactly the learning frequency; ML-Agents never
-    does that -- `play_against_latest_model_ratio` picks between saved SNAPSHOTS
-    and swaps them every `swap_steps`, so the opponent is frozen while you learn
-    against it. A 7900-update run played live-self or bank for 98% of its last
-    600 updates and drifted from 63% to 45% against its own bank.
 
-    Bots keep a floor. PFSP's (1-score)^p correctly stops wasting rollouts on
-    opponents we already beat 100%, but with 10 bank entries near 0.50 it drove
-    expander/hunter/harvester to 10 updates out of 600 -- deleting the only
-    fixed yardstick in the system, so nothing could tell improvement from decay.
-    The floor guarantees one absolute reference roughly every 1/bot_floor updates,
-    and PFSP still decides WHICH bot: the ones we crush stay rare.
+def choose_opponent(args, bank, anchors, league, key):
+    """Easy-first until the agent can win, then PFSP hardest-first, split across
+    up to four EXCLUSIVE slices of the roll: anchors, self-play, scripted bots,
+    bank. Each floor means what it says, independent of how many entries the
+    other pools happen to have.
 
-    Bootstrap mode (nothing beaten yet): the weighting flips to prefer the
-    opponent we are doing BEST against -- the only one that can produce a first
-    win to learn from.
+    Self-play (`--self-floor`) plays train_state.params directly, which
+    choose_opponent used to refuse outright: "the opponent is non-stationary at
+    exactly the learning frequency; ML-Agents never does that -- it swaps between
+    saved SNAPSHOTS every `swap_steps`, so the opponent is frozen while you learn
+    against it. A 7900-update run played live-self or bank for 98%% of its last
+    600 updates and drifted from 63%% to 45%% against its own bank." That risk is
+    real and un-fixed here -- --self-floor is 0 by default, and turning it on is
+    a deliberate choice to trade a frozen reference for however self-play alone
+    performs against the bank/anchors, which still work exactly as before.
+
+    Bots keep a floor for the same reason as always: PFSP's (1-score)^p stops
+    wasting rollouts on opponents already beaten 100%, but that also means an
+    UNFLOORED yardstick can vanish from the log entirely. --bot-floor 0 removes
+    the scripted bots from the pool -- and with them, the bootstrap phase, which
+    has nothing to measure if bots are never played (their score would sit at
+    0.0 forever, permanently misreading "cold start").
+
+    Bootstrap mode (nothing beaten yet, only reachable with --bot-floor > 0):
+    the weighting flips to prefer the opponent we are doing BEST against -- the
+    only one that can produce a first win to learn from.
     """
     k_floor, k_pick = jrandom.split(key)
     bot_scores = [league_score(league["bots"][n]) for n in SCRIPTED]
 
-    if bootstrapping(league):
+    if args.bot_floor > 0 and bootstrapping(league):
         weights = [(s + 0.05) ** args.pfsp_power for s in bot_scores]
         total = sum(weights)
         weights = [w / total for w in weights]
         i = int(jrandom.choice(k_pick, len(SCRIPTED), p=jnp.asarray(weights)))
-        return Opponent(i, SCRIPTED[i], -1)
+        return Opponent(i, SCRIPTED[i])
 
-    if not bank or float(jrandom.uniform(k_floor)) < args.bot_floor:
-        weights = pfsp_weights(bot_scores, args.pfsp_power)
-        i = int(jrandom.choice(k_pick, len(SCRIPTED), p=jnp.asarray(weights)))
-        return Opponent(i, SCRIPTED[i], -1)
+    anchor_share = args.anchor_floor if anchors else 0.0
+    self_share = args.self_floor
+    bot_share = args.bot_floor
+    bank_share = max(0.0, 1.0 - anchor_share - self_share - bot_share)
+    if not bank:
+        # Nothing to PFSP over -- redirect that slice to self-play rather than
+        # crashing on an empty choice().
+        self_share += bank_share
+        bank_share = 0.0
 
-    labels = list(SCRIPTED) + [f"bank[{i}]" for i in range(len(league["bank"]))]
-    scores = bot_scores + [league_score(st) for st in league["bank"]]
-    weights = pfsp_weights(scores, args.pfsp_power)
-    i = int(jrandom.choice(k_pick, len(labels), p=jnp.asarray(weights)))
-    if i < len(SCRIPTED):
-        return Opponent(i, labels[i], -1)
-    return Opponent(NETWORK, labels[i], i - len(SCRIPTED))
+    roll = float(jrandom.uniform(k_floor))
+    if roll < anchor_share:
+        i = pfsp_pick(k_pick, [league_score(league["anchors"][a.name]) for a in anchors],
+                      args.pfsp_power)
+        return Opponent(NETWORK, f"@{anchors[i].name}", anchor_idx=i)
+    roll -= anchor_share
+
+    if roll < self_share:
+        return Opponent(NETWORK, "self")
+    roll -= self_share
+
+    if roll < bot_share:
+        i = pfsp_pick(k_pick, bot_scores, args.pfsp_power)
+        return Opponent(i, SCRIPTED[i])
+
+    i = pfsp_pick(k_pick, [league_score(st) for st in league["bank"]], args.pfsp_power)
+    return Opponent(NETWORK, f"bank[{i}]", bank_idx=i)
+
+
+def league_stats(league, anchors, opponent):
+    """The stats row this opponent's result belongs in, or None for live self --
+    there is no fixed reference to accumulate self-play's outcomes against."""
+    if opponent.anchor_idx >= 0:
+        return league["anchors"][anchors[opponent.anchor_idx].name]
+    if opponent.bank_idx >= 0:
+        return league["bank"][opponent.bank_idx]
+    if opponent.kind != NETWORK:
+        return league["bots"][opponent.label]
+    return None
 
 
 def league_table(league):
     cells = ["BOOTSTRAP" if bootstrapping(league) else "pfsp"]
     cells += [f"{n} {league_score(st):.2f}" for n, st in league["bots"].items()]
+    cells += [f"@{n} {league_score(st):.2f}" for n, st in league.get("anchors", {}).items()]
     cells += [f"b{i} {league_score(st):.2f}" for i, st in enumerate(league["bank"])]
     return "  ".join(cells)
 
@@ -390,7 +451,25 @@ def main():
     parser.add_argument("--target-kl", type=float, default=0.02)
     parser.add_argument("--bot-floor", type=float, default=0.15,
                         help="minimum share of updates played against the scripted bots, "
-                             "so an absolute yardstick never leaves the log")
+                             "so an absolute yardstick never leaves the log. 0 removes the "
+                             "bots from the pool entirely (and skips the bootstrap phase, "
+                             "which would otherwise stay on forever with nothing to measure "
+                             "bot win rate from)")
+    parser.add_argument("--self-floor", type=float, default=0.0,
+                        help="share of updates played against the LIVE policy instead of a "
+                             "frozen bank snapshot. choose_opponent's docstring warns against "
+                             "this: a 7900-update run that played live-self/bank 98% of its "
+                             "last 600 updates drifted 63%%->45%% against its own bank, because "
+                             "the opponent is non-stationary at exactly the learning frequency. "
+                             "0 (default) never does this")
+    parser.add_argument("--anchors", default=None,
+                        help="comma-separated frozen opponents, each 'path' or 'name=path'. "
+                             "Accepts a .pkl checkpoint, an export .npz or a submission .zip. "
+                             "Never trained, never banked, never evicted -- the only score in "
+                             "the log that can rise (or fall) across the whole run, since the "
+                             "bank's own eviction rule pins its win rate near 0.50")
+    parser.add_argument("--anchor-floor", type=float, default=0.10,
+                        help="share of updates played against the anchors (ignored with none)")
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--bank-size", type=int, default=10)
     parser.add_argument("--no-stagger", action="store_true")
@@ -466,6 +545,11 @@ def main():
         jnp.ones((num_actions(height, width),), bool),
         jnp.zeros((NUM_OPPONENT_KINDS,), jnp.float32),
     )
+    # Keep the freshly built tree as the shape reference for anchors. `params`
+    # below is overwritten by --resume, and a resumed checkpoint can itself carry
+    # an old value-head width -- then it would be conforming anchors to the wrong
+    # target. The init is always what the current code expects.
+    reference = jax.tree.map(np.asarray, params)
     blob = None
     if args.resume and os.path.exists(args.resume):
         with open(args.resume, "rb") as fh:
@@ -483,6 +567,13 @@ def main():
         optax.adam(config["LR"], eps=1e-5),
     )
     train_state = TrainState.create(apply_fn=network.apply, params=params, tx=tx)
+
+    frozen = anchors.load(args.anchors, reference)
+    for a in frozen:
+        print(f"anchor @{a.name}: {a.path}")
+    anchor_params = [to_jax(a.params) for a in frozen]
+    if not frozen and args.anchors:
+        print("no anchors loaded -- nothing but the bank measures this run")
 
     start_update, bank, league = 0, [], None
     if blob is not None:
@@ -504,7 +595,12 @@ def main():
         )
     if (not league or sorted(league.get("bots", {})) != sorted(SCRIPTED)
             or len(league.get("bank", [])) != len(bank)):
-        league = init_league(bank)   # older checkpoint: everyone starts "unbeaten"
+        league = init_league(bank, frozen)   # older checkpoint: everyone starts "unbeaten"
+    else:
+        # Adding anchors to a run in flight must NOT reset the bot and bank
+        # history -- that history is the only thing that stops PFSP from
+        # re-bootstrapping on opponents it already beat.
+        sync_anchors(league, frozen)
 
     rollout = jax.jit(make_rollout(env, network, pool, build_scripted(), config))
     update_epoch = make_update(network.apply, config)
@@ -532,8 +628,13 @@ def main():
         # beating anyone; ML-Agents holds one fixed for ~10k steps for exactly
         # this reason. `held is None` covers the first update after a resume.
         if held is None or update % max(args.opp_swap_every, 1) == 0:
-            held = choose_opponent(args, bank, league, k_opp)
-        opp_params = bank[held.bank_idx] if held.bank_idx >= 0 else train_state.params
+            held = choose_opponent(args, bank, frozen, league, k_opp)
+        if held.anchor_idx >= 0:
+            opp_params = anchor_params[held.anchor_idx]
+        elif held.bank_idx >= 0:
+            opp_params = bank[held.bank_idx]
+        else:
+            opp_params = train_state.params  # self-play, or nothing else matched
 
         carry, traj, last_value, outcome, terminal, ep_return, done = rollout(
             train_state.params, opp_params, states, beliefs, opp_beliefs, returns_so_far, seat,
@@ -562,13 +663,12 @@ def main():
             f"upd {update:5d} | loss {total_loss:+.3f} v {value_loss:.3f} pi {actor_loss:+.3f} "
             f"H {ent:.2f} kl {kl:.3f}/{applied:.0%} | rew {rew:+.3f} ep {ep_rew:+.2f} (T{ep_term:+.1f}) "
             f"| eps {episodes:4d} W/L/D {wins:3d}/{losses:3d}/{draws:3d} "
-            f"| vs {held.label:9s} "
+            f"| vs {held.label:12s} "
             f"| alpha {alpha:.2f} | sps {args.envs * args.steps / elapsed:7.0f} | {elapsed:5.1f}s"
         )
 
         if episodes:
-            stats = (league["bots"][held.label] if held.kind != NETWORK
-                     else league["bank"][held.bank_idx] if held.bank_idx >= 0 else None)
+            stats = league_stats(league, frozen, held)
             if stats is not None:
                 for j, v in enumerate((wins, draws, episodes)):
                     stats[j] = LEAGUE_DECAY * stats[j] + v

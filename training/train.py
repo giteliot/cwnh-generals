@@ -42,7 +42,7 @@ STAGES = {
 }
 
 DEFAULT_CONFIG = dict(
-    LR=3e-4,
+    LR=1e-4,
     GAMMA=0.9999,
     GAE_LAMBDA=0.95,
     CLIP_EPS=0.2,
@@ -647,6 +647,34 @@ def main():
         wins = int(((outcome > 0) & done).sum())
         losses = int(((outcome < 0) & done).sum())
         draws = episodes - wins - losses
+
+        # Split the same counters by which SIDE the learner sat on. `seat` is
+        # fixed for the whole run (env i -> player i%2, 1024 each way), so a game
+        # between two identical policies -- which is exactly what `vs self` is,
+        # since opp_params IS train_state.params -- must score 0.500 overall.
+        #
+        # It does not. Tallying a real run's `vs self` lines gave 7180W/8324L/424D
+        # over 15928 games = 0.464, a 3.6-point deficit far outside noise. That
+        # means the learner and the opponent are not interchangeable somewhere,
+        # and since self-play is most of the training signal, the policy spends
+        # most of its updates being told it is behind in a level matchup.
+        #
+        # This split says which bug it is:
+        #   p0 and p1 straddle 0.500 (0.5-d / 0.5+d)  -> a seat/move-order
+        #     asymmetry that is failing to cancel. _determine_move_order breaks
+        #     exact army ties with `army_1 < army_0` (strict), so player 0 always
+        #     moves first on a tie, and moving second is the advantage.
+        #   BOTH halves below 0.500                   -> the opponent is not
+        #     actually playing the same policy; the bug is in the rollout.
+        p0 = ~seat                                   # learner is player 0
+        w0 = int(((outcome > 0) & done & p0).sum())
+        l0 = int(((outcome < 0) & done & p0).sum())
+        n0 = int((done & p0).sum())
+        w1, l1 = wins - w0, losses - l0
+        n1 = episodes - n0
+        s0 = (w0 + 0.5 * (n0 - w0 - l0)) / n0 if n0 else float("nan")
+        s1 = (w1 + 0.5 * (n1 - w1 - l1)) / n1 if n1 else float("nan")
+
         elapsed = time.time() - t0
         total_loss, value_loss, actor_loss, ent, kl, applied = [float(jnp.mean(x)) for x in info]
         # rew: mean reward per env over this rollout (terminal + alpha*shaping).
@@ -663,6 +691,7 @@ def main():
             f"upd {update:5d} | loss {total_loss:+.3f} v {value_loss:.3f} pi {actor_loss:+.3f} "
             f"H {ent:.2f} kl {kl:.3f}/{applied:.0%} | rew {rew:+.3f} ep {ep_rew:+.2f} (T{ep_term:+.1f}) "
             f"| eps {episodes:4d} W/L/D {wins:3d}/{losses:3d}/{draws:3d} "
+            f"| p0 {s0:.3f}({n0:4d}) p1 {s1:.3f}({n1:4d}) "
             f"| vs {held.label:12s} "
             f"| alpha {alpha:.2f} | sps {args.envs * args.steps / elapsed:7.0f} | {elapsed:5.1f}s"
         )

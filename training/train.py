@@ -470,6 +470,22 @@ def main():
                              "bank's own eviction rule pins its win rate near 0.50")
     parser.add_argument("--anchor-floor", type=float, default=0.10,
                         help="share of updates played against the anchors (ignored with none)")
+    parser.add_argument("--promote-threshold", type=float, default=0.55,
+                        help="league_score needed against an anchor before the live policy's "
+                             "weights replace it. 0.55 is AlphaGo Zero's own challenger-vs-best "
+                             "promotion threshold -- clearly ahead, not just tied")
+    parser.add_argument("--promote-min-games", type=int, default=100,
+                        help="minimum EMA-tracked games against an anchor before its score is "
+                             "trusted for promotion")
+    parser.add_argument("--promote-min-updates", type=int, default=200,
+                        help="minimum updates since an anchor's last promotion (or the run "
+                             "start) before it can be promoted again. --promote-min-games is "
+                             "NOT enough smoothing on its own: right after a reset, league_score "
+                             "is an EMA that can cross any games threshold in a SINGLE update if "
+                             "that update happens to finish many episodes, giving zero real "
+                             "smoothing exactly when it matters most. This is the guard that "
+                             "actually enforces a cooldown, independent of how episodes happen "
+                             "to land in a batch")
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--bank-size", type=int, default=10)
     parser.add_argument("--no-stagger", action="store_true")
@@ -616,6 +632,10 @@ def main():
         return carry[0], info
 
     held = None
+    # Grace period before an anchor can be promoted again -- see
+    # --promote-min-updates. Starts at start_update (not 0) so a resumed run
+    # does not treat every anchor as instantly eligible.
+    promoted_at = {a.name: start_update for a in frozen}
     for update in range(start_update, args.updates):
         t0 = time.time()
         progress = update / max(args.updates * args.anneal_frac, 1)
@@ -701,6 +721,30 @@ def main():
             if stats is not None:
                 for j, v in enumerate((wins, draws, episodes)):
                     stats[j] = LEAGUE_DECAY * stats[j] + v
+
+        # Promote: replace an anchor's weights with the live policy once it has
+        # CLEARLY passed it, not merely tied it -- AlphaGo Zero's own
+        # challenger-vs-best protocol. Two independent guards, not one:
+        # --promote-min-games AND --promote-min-updates. games alone is not
+        # enough smoothing -- right after a reset, league_score's EMA can cross
+        # any games threshold in a SINGLE update if that update happens to
+        # finish many episodes, which is exactly zero smoothing at the moment
+        # it matters most. --promote-min-updates enforces a real cooldown
+        # regardless of how episodes happen to land in a batch.
+        for i, a in enumerate(frozen):
+            astats = league["anchors"][a.name]
+            score = league_score(astats)
+            if (astats[2] >= args.promote_min_games
+                    and update - promoted_at[a.name] >= args.promote_min_updates
+                    and score >= args.promote_threshold):
+                games = astats[2]
+                anchor_params[i] = jax.tree.map(jnp.copy, train_state.params)
+                league["anchors"][a.name] = [0.0, 0.0, 0.0]
+                promoted_at[a.name] = update
+                promo_path = f"{args.out}.promoted_{a.name}_upd{update}.pkl"
+                save(promo_path, train_state, update, bank, league, key, args)
+                print(f"    promoted @{a.name} at update {update} "
+                      f"(score {score:.3f} over {games:.0f} games) -> {promo_path}")
 
         if (update + 1) % args.checkpoint_every == 0:
             # Snapshot on a timer -- ML-Agents `save_steps`. The old gate ("bank

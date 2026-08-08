@@ -278,7 +278,10 @@ def choose_opponent(args, bank, anchors, league, key):
     roll -= self_share
 
     if roll < bot_share:
-        i = pfsp_pick(k_pick, bot_scores, args.pfsp_power)
+        if args.bot_only:
+            i = SCRIPTED.index(args.bot_only)
+        else:
+            i = pfsp_pick(k_pick, bot_scores, args.pfsp_power)
         return Opponent(i, SCRIPTED[i])
 
     i = pfsp_pick(k_pick, [league_score(st) for st in league["bank"]], args.pfsp_power)
@@ -455,6 +458,14 @@ def main():
                              "bots from the pool entirely (and skips the bootstrap phase, "
                              "which would otherwise stay on forever with nothing to measure "
                              "bot win rate from)")
+    parser.add_argument("--bot-only", default=None, choices=SCRIPTED,
+                        help="within --bot-floor's share, ALWAYS play this one bot instead of "
+                             "letting PFSP choose among all three. PFSP weights by "
+                             "(1-league_score)^power, so a bot the training-side score already "
+                             "calls 'beaten' gets starved of updates even if it is not reliably "
+                             "closed out live -- e.g. games observed drawing against expander in "
+                             "production while its league_score says it is fine. Forcing it "
+                             "keeps the full --bot-floor budget on the one that actually needs it")
     parser.add_argument("--self-floor", type=float, default=0.0,
                         help="share of updates played against the LIVE policy instead of a "
                              "frozen bank snapshot. choose_opponent's docstring warns against "

@@ -731,6 +731,18 @@ def main():
         # finish many episodes, which is exactly zero smoothing at the moment
         # it matters most. --promote-min-updates enforces a real cooldown
         # regardless of how episodes happen to land in a batch.
+        #
+        # A promotion updates anchor_params IN MEMORY ONLY unless it is also
+        # written to a.path. Every resume calls anchors.load(args.anchors, ...)
+        # fresh from that file -- nothing about a past promotion is stored in
+        # the periodic --out checkpoint's "anchors" field, which saves just the
+        # CLI path string, not weights. Without this write, resuming silently
+        # reverts the anchor to whatever it was BEFORE any promotion in the
+        # previous session, and the live policy -- which resumed at its true,
+        # fully-trained strength -- looks like it dominates from update one.
+        # save() writes a "params" field in exactly the shape anchors.py's
+        # read_params() expects for a .pkl; everything else in the blob (bank,
+        # opt_state, ...) is irrelevant here and simply ignored on load.
         for i, a in enumerate(frozen):
             astats = league["anchors"][a.name]
             score = league_score(astats)
@@ -741,6 +753,11 @@ def main():
                 anchor_params[i] = jax.tree.map(jnp.copy, train_state.params)
                 league["anchors"][a.name] = [0.0, 0.0, 0.0]
                 promoted_at[a.name] = update
+                if a.path.endswith(".pkl"):
+                    save(a.path, train_state, update, bank, league, key, args)
+                else:
+                    print(f"    WARNING: anchor @{a.name}'s source {a.path} is not a .pkl -- "
+                          f"cannot persist the promotion there, it WILL be lost on resume")
                 promo_path = f"{args.out}.promoted_{a.name}_upd{update}.pkl"
                 save(promo_path, train_state, update, bank, league, key, args)
                 print(f"    promoted @{a.name} at update {update} "

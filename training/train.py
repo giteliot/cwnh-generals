@@ -527,31 +527,40 @@ def main():
         f"| est VRAM: buffer {buffer_gb:.1f} GB + activations {activations_gb:.1f} GB"
     )
 
-    states = jax.tree.map(lambda x: x[: args.envs], pool)
-    states = states._replace(pool_idx=jnp.arange(args.envs, dtype=jnp.int32))
     seat = (jnp.arange(args.envs) % 2).astype(bool)
-    # Each side needs its OWN memory. Feeding one belief to both, then keeping
-    # only the learner's, hands the opponent its enemy's map knowledge and move
-    # trail every rollout -- it plays blind and the learner "wins" 98% of games
-    # against a crippled copy of itself.
-    beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
-    opp_beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
-    returns_so_far = jnp.zeros((args.envs,), jnp.float32)
 
-    # Stagger the env clocks. Every env starts at turn 0, so without this they
-    # all reach the 1200-turn truncation on the SAME update and reset together:
-    # the terminal signal arrives in one lump every ~37 updates and `eps` reads
-    # 0 in between, leaving the agent trained almost entirely on shaping.
-    # Offsetting the first episode spreads the endings out permanently. Capped
-    # below the turn-800 deathtouch so the opening episode is not decided
-    # instantly on a board that has not developed.
-    if not args.no_stagger:
-        key, k_stagger = jrandom.split(key)
-        span = min(env.truncation, 700)
-        states = states._replace(
-            time=jrandom.randint(k_stagger, (args.envs,), 0, span).astype(states.time.dtype)
-        )
-        print(f"staggered env clocks across turns 0-{span - 1}")
+    def fresh_envs(key, announce):
+        """Every env starts a brand new episode. Used at startup, and again at
+        every promotion -- see the call site for why a promotion needs this."""
+        states = jax.tree.map(lambda x: x[: args.envs], pool)
+        states = states._replace(pool_idx=jnp.arange(args.envs, dtype=jnp.int32))
+        # Each side needs its OWN memory. Feeding one belief to both, then
+        # keeping only the learner's, hands the opponent its enemy's map
+        # knowledge and move trail every rollout -- it plays blind and the
+        # learner "wins" 98% of games against a crippled copy of itself.
+        beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
+        opp_beliefs = jax.vmap(lambda _: init_belief((height, width)))(jnp.arange(args.envs))
+        returns_so_far = jnp.zeros((args.envs,), jnp.float32)
+
+        # Stagger the env clocks. Every env starts at turn 0, so without this
+        # they all reach the 1200-turn truncation on the SAME update and reset
+        # together: the terminal signal arrives in one lump every ~37 updates
+        # and `eps` reads 0 in between, leaving the agent trained almost
+        # entirely on shaping. Offsetting the first episode spreads the
+        # endings out permanently. Capped below the turn-800 deathtouch so the
+        # opening episode is not decided instantly on a board that has not
+        # developed.
+        if not args.no_stagger:
+            key, k_stagger = jrandom.split(key)
+            span = min(env.truncation, 700)
+            states = states._replace(
+                time=jrandom.randint(k_stagger, (args.envs,), 0, span).astype(states.time.dtype)
+            )
+            if announce:
+                print(f"staggered env clocks across turns 0-{span - 1}")
+        return key, states, beliefs, opp_beliefs, returns_so_far
+
+    key, states, beliefs, opp_beliefs, returns_so_far = fresh_envs(key, announce=True)
 
     network = ActorCritic(channels=args.channels, blocks=args.blocks, groups=args.groups)
     params = network.init(
@@ -762,6 +771,25 @@ def main():
                 save(promo_path, train_state, update, bank, league, key, args)
                 print(f"    promoted @{a.name} at update {update} "
                       f"(score {score:.3f} over {games:.0f} games) -> {promo_path}")
+
+                # Force every in-flight episode to end NOW. Episodes run up to
+                # `truncation` (1200) turns = ~37 updates; without this, any
+                # game already in progress keeps running with the OLD (weaker,
+                # pre-promotion) anchor for most of its length and only its
+                # last few turns against the new one, then gets scored as a
+                # win for the learner and attributed to @{a.name} anyway --
+                # inflating the score to 0.80-0.90+ for the better part of an
+                # hour after every single promotion. Worse, that inflated
+                # score can itself clear --promote-threshold, triggering
+                # ANOTHER promotion on entirely contaminated data. A full
+                # reset is correct here because --anchor-floor 1.0 means every
+                # env is playing this anchor anyway; if a future run mixes
+                # anchors with bank/self/bots, this would also cut short
+                # perfectly clean games in progress against THOSE opponents,
+                # which is wasteful but not incorrect.
+                key, states, beliefs, opp_beliefs, returns_so_far = fresh_envs(key, announce=False)
+                held = None   # re-pick against the reset envs, not a stale hold
+                print("    reset all envs to flush games contaminated by the promotion")
 
         if (update + 1) % args.checkpoint_every == 0:
             # Snapshot on a timer -- ML-Agents `save_steps`. The old gate ("bank

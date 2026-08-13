@@ -1,0 +1,150 @@
+"""Training loop (Phase 10): collect rollout -> GAE -> PPO update -> repeat.
+
+Runs config.ppo.num_envs environments in parallel via jax.vmap (Phase 9), and
+mixes self-play against a checkpoint pool with scripted bots (Phase 14).
+"""
+import jax.numpy as jnp
+import jax.random as jrandom
+
+from generals.core.env import GeneralsEnv
+from generals_rl import checkpoint as checkpoint_lib
+from generals_rl.config import Config
+from generals_rl.env_adapter import RLEnvAdapter
+from generals_rl.gae import compute_gae
+from generals_rl.network import ActorCritic
+from generals_rl.opponent_pool import create_pool, maybe_promote, stack_pool
+from generals_rl.opponents import sample_opponent_assignment
+from generals_rl.parallel import reset_parallel
+from generals_rl.ppo import PPOConfig, create_train_state, update
+from generals_rl.rollout import collect_rollout
+
+
+def _ppo_config_from(config: Config) -> PPOConfig:
+    return PPOConfig(
+        learning_rate=config.ppo.learning_rate,
+        clip_coef=config.ppo.clip_coef,
+        entropy_coef=config.ppo.entropy_coef,
+        value_coef=config.ppo.value_coef,
+        num_epochs=config.ppo.num_epochs,
+        minibatch_size=config.ppo.minibatch_size,
+        max_grad_norm=config.ppo.max_grad_norm,
+    )
+
+
+def train(
+    env: GeneralsEnv,
+    config: Config,
+    checkpoint_dir: str | None = None,
+    resume_from: int | None = None,
+    num_iterations: int | None = None,
+):
+    """Train. `num_iterations`, if given, overrides config.training.total_timesteps-derived
+    iteration count with an explicit count run from start_iteration — used for curriculum
+    stages, where each stage runs a fixed number of additional iterations rather than
+    training up to a fixed cumulative timestep count."""
+    if resume_from is not None and checkpoint_dir is None:
+        raise ValueError("checkpoint_dir is required when resume_from is set")
+
+    adapter = RLEnvAdapter(
+        env,
+        terminal_win_reward=config.reward.terminal_win_reward,
+        terminal_loss_reward=config.reward.terminal_loss_reward,
+        terminal_draw_reward=config.reward.terminal_draw_reward,
+        shaping_alpha=config.reward.shaping_alpha,
+        gamma=config.ppo.gamma,
+        shaping_max_ratio=config.reward.shaping_max_ratio,
+    )
+
+    key = jrandom.PRNGKey(config.training.seed)
+    key, reset_key, init_key = jrandom.split(key, 3)
+    observation, adapter_state, pool = reset_parallel(adapter, reset_key, config.ppo.num_envs)
+
+    model = ActorCritic(num_channels=config.network.num_channels)
+    params = model.init(init_key, observation[0])
+    ppo_config = _ppo_config_from(config)
+    train_state = create_train_state(model, params, ppo_config)
+
+    start_iteration = 0
+    if resume_from is not None:
+        train_state, key = checkpoint_lib.restore(checkpoint_dir, resume_from, train_state, key)
+        start_iteration = resume_from + 1
+
+    # Note: the checkpoint pool itself isn't persisted/restored (Phase 12 only
+    # saves params/opt_state/key) — resuming restarts the pool from the
+    # resumed params alone, losing prior pool history.
+    opponent_pool = create_pool(train_state.params)
+
+    steps_per_iteration = config.ppo.rollout_length * config.ppo.num_envs
+    if num_iterations is not None:
+        end_iteration = start_iteration + num_iterations
+    else:
+        end_iteration = config.training.total_timesteps // steps_per_iteration
+
+    for iteration in range(start_iteration, end_iteration):
+        key, rollout_key, update_key, opponent_assign_key, promote_key = jrandom.split(key, 5)
+
+        opponent_pool_params = stack_pool(opponent_pool)
+        opponent_kinds, opponent_checkpoint_idx = sample_opponent_assignment(
+            opponent_assign_key,
+            config.ppo.num_envs,
+            config.opponent.pool_checkpoint_weight,
+            config.opponent.scripted_bot_weights,
+            len(opponent_pool),
+        )
+
+        rollout, adapter_state, observation, _ = collect_rollout(
+            adapter, model, train_state.params, adapter_state, observation, pool,
+            opponent_pool_params, opponent_kinds, opponent_checkpoint_idx,
+            rollout_key, config.ppo.rollout_length,
+        )
+        advantages, returns = compute_gae(rollout, config.ppo.gamma, config.ppo.gae_lambda)
+
+        # Flatten (rollout_length, num_envs, ...) -> (rollout_length * num_envs, ...) for PPO minibatching.
+        flatten = lambda x: x.reshape(-1, *x.shape[2:])
+        train_state, metrics = update(
+            train_state,
+            model,
+            flatten(rollout.observations),
+            flatten(rollout.actions),
+            flatten(rollout.log_probs),
+            flatten(advantages),
+            flatten(returns),
+            update_key,
+            ppo_config,
+        )
+
+        if iteration % config.training.log_frequency == 0:
+            num_episodes = int(jnp.sum(rollout.terminated | rollout.truncated))
+            mean_reward = float(jnp.mean(rollout.rewards))
+            print(
+                f"iter {iteration} | steps {iteration * steps_per_iteration} | "
+                f"episodes {num_episodes} | mean_reward {mean_reward:.4f} | "
+                + " | ".join(f"{k} {float(v):.4f}" for k, v in metrics.items())
+            )
+
+        if checkpoint_dir is not None and (iteration + 1) % config.training.checkpoint_frequency == 0:
+            checkpoint_lib.save(checkpoint_dir, iteration, train_state, key, config)
+
+        if (iteration + 1) % config.opponent.pool_update_frequency == 0:
+            opponent_pool, promoted, win_rate = maybe_promote(
+                env,
+                model,
+                opponent_pool,
+                train_state.params,
+                config.opponent.pool_size,
+                config.opponent.pool_win_rate_threshold,
+                config.opponent.pool_eval_games,
+                promote_key,
+            )
+            print(f"pool check | win_rate {win_rate:.2f} | promoted {promoted} | pool_size {len(opponent_pool)}")
+
+        # Evaluation (Phase 13) goes here, gated on config.training.evaluation_frequency.
+        # Not yet wired into the loop — see generals_rl/evaluate.py for the standalone version.
+
+    if checkpoint_dir is not None and end_iteration > start_iteration:
+        # Always checkpoint at the end of a run/stage, regardless of checkpoint_frequency
+        # alignment, so a caller (e.g. curriculum training) has a well-defined step to
+        # resume_from for the next stage.
+        checkpoint_lib.save(checkpoint_dir, end_iteration - 1, train_state, key, config)
+
+    return train_state

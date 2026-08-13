@@ -35,6 +35,53 @@ def _ppo_config_from(config: Config) -> PPOConfig:
     )
 
 
+def _train_step(
+    adapter,
+    model,
+    ppo_config,
+    rollout_length,
+    gamma,
+    gae_lambda,
+    train_state,
+    adapter_state,
+    observation,
+    pool,
+    opponent_pool_params,
+    opponent_kinds,
+    opponent_checkpoint_idx,
+    key,
+):
+    """One rollout-collection + GAE + PPO-update step. adapter/model/ppo_config/rollout_length
+    must be static (hashable, constant across calls) so this compiles once and is reused —
+    without jax.jit here, every iteration would fully retrace and recompile from scratch."""
+    rollout_key, update_key = jrandom.split(key)
+
+    rollout, adapter_state, observation, _ = collect_rollout(
+        adapter, model, train_state.params, adapter_state, observation, pool,
+        opponent_pool_params, opponent_kinds, opponent_checkpoint_idx,
+        rollout_key, rollout_length,
+    )
+    advantages, returns = compute_gae(rollout, gamma, gae_lambda)
+
+    flatten = lambda x: x.reshape(-1, *x.shape[2:])
+    train_state, metrics = update(
+        train_state,
+        model,
+        flatten(rollout.observations),
+        flatten(rollout.actions),
+        flatten(rollout.log_probs),
+        flatten(advantages),
+        flatten(returns),
+        update_key,
+        ppo_config,
+    )
+
+    return train_state, adapter_state, observation, rollout, metrics
+
+
+_jit_train_step = jax.jit(_train_step, static_argnums=(0, 1, 2, 3))
+
+
 def _opponent_breakdown(rollout: Rollout, opponent_kinds: jnp.ndarray) -> dict[str, tuple[int, int, int]]:
     """Win/loss/draw counts from this rollout, broken down by opponent kind."""
     done = np.asarray(rollout.terminated | rollout.truncated)  # (T, N)
@@ -105,7 +152,7 @@ def train(
 
     for iteration in range(start_iteration, end_iteration):
         iteration_start_time = time.time()
-        key, rollout_key, update_key, opponent_assign_key, promote_key = jrandom.split(key, 5)
+        key, rollout_key, opponent_assign_key, promote_key = jrandom.split(key, 4)
 
         opponent_pool_params = stack_pool(opponent_pool)
         opponent_kinds, opponent_checkpoint_idx = sample_opponent_assignment(
@@ -116,25 +163,12 @@ def train(
             len(opponent_pool),
         )
 
-        rollout, adapter_state, observation, _ = collect_rollout(
-            adapter, model, train_state.params, adapter_state, observation, pool,
+        train_state, adapter_state, observation, rollout, metrics = _jit_train_step(
+            adapter, model, ppo_config, config.ppo.rollout_length,
+            config.ppo.gamma, config.ppo.gae_lambda,
+            train_state, adapter_state, observation, pool,
             opponent_pool_params, opponent_kinds, opponent_checkpoint_idx,
-            rollout_key, config.ppo.rollout_length,
-        )
-        advantages, returns = compute_gae(rollout, config.ppo.gamma, config.ppo.gae_lambda)
-
-        # Flatten (rollout_length, num_envs, ...) -> (rollout_length * num_envs, ...) for PPO minibatching.
-        flatten = lambda x: x.reshape(-1, *x.shape[2:])
-        train_state, metrics = update(
-            train_state,
-            model,
-            flatten(rollout.observations),
-            flatten(rollout.actions),
-            flatten(rollout.log_probs),
-            flatten(advantages),
-            flatten(returns),
-            update_key,
-            ppo_config,
+            rollout_key,
         )
 
         if iteration % config.training.log_frequency == 0:

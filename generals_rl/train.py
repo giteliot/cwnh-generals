@@ -4,6 +4,7 @@ Runs config.ppo.num_envs environments in parallel via jax.vmap (Phase 9), and
 mixes self-play against a checkpoint pool with scripted bots (Phase 14).
 """
 import time
+from collections import deque
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +18,7 @@ from generals_rl.env_adapter import RLEnvAdapter
 from generals_rl.gae import compute_gae
 from generals_rl.network import ActorCritic
 from generals_rl.opponent_pool import create_pool, maybe_promote, stack_pool
-from generals_rl.opponents import KIND_NAMES, sample_opponent_assignment
+from generals_rl.opponents import KIND_NAMES, POLICY_KIND, sample_opponent_assignment
 from generals_rl.parallel import reset_parallel
 from generals_rl.ppo import PPOConfig, create_train_state, update
 from generals_rl.rollout import Rollout, collect_rollout
@@ -68,6 +69,7 @@ def _train_step(
         train_state,
         model,
         flatten(rollout.observations),
+        flatten(rollout.valid_masks),
         flatten(rollout.actions),
         flatten(rollout.log_probs),
         flatten(advantages),
@@ -99,6 +101,18 @@ def _opponent_breakdown(rollout: Rollout, opponent_kinds: jnp.ndarray) -> dict[s
         draws = total - wins - losses
         stats[name] = (wins, losses, draws)
     return stats
+
+
+def _pool_game_outcomes(rollout: Rollout, opponent_kinds: jnp.ndarray) -> list[float]:
+    """1.0/0.0 (win/not-win) for each pool-opponent game that finished this rollout."""
+    done = np.asarray(rollout.terminated | rollout.truncated)
+    winner = np.asarray(rollout.winner)
+    kinds = np.broadcast_to(np.asarray(opponent_kinds), done.shape)
+
+    mask = done & (kinds == POLICY_KIND)
+    wins = int((mask & (winner == 0)).sum())
+    non_wins = int(mask.sum()) - wins
+    return [1.0] * wins + [0.0] * non_wins
 
 
 def train(
@@ -143,6 +157,7 @@ def train(
     # saves params/opt_state/key) — resuming restarts the pool from the
     # resumed params alone, losing prior pool history.
     opponent_pool = create_pool(train_state.params)
+    pool_outcomes = deque(maxlen=config.opponent.pool_win_rate_window)
 
     steps_per_iteration = config.ppo.rollout_length * config.ppo.num_envs
     if num_iterations is not None:
@@ -152,7 +167,7 @@ def train(
 
     for iteration in range(start_iteration, end_iteration):
         iteration_start_time = time.time()
-        key, rollout_key, opponent_assign_key, promote_key = jrandom.split(key, 4)
+        key, rollout_key, opponent_assign_key = jrandom.split(key, 3)
 
         opponent_pool_params = stack_pool(opponent_pool)
         opponent_kinds, opponent_checkpoint_idx = sample_opponent_assignment(
@@ -170,6 +185,7 @@ def train(
             opponent_pool_params, opponent_kinds, opponent_checkpoint_idx,
             rollout_key,
         )
+        pool_outcomes.extend(_pool_game_outcomes(rollout, opponent_kinds))
 
         if iteration % config.training.log_frequency == 0:
             # JAX dispatches asynchronously; block on the actual result before timing.
@@ -195,17 +211,18 @@ def train(
             checkpoint_lib.save(checkpoint_dir, iteration, train_state, key, config)
 
         if (iteration + 1) % config.opponent.pool_update_frequency == 0:
-            opponent_pool, promoted, win_rate = maybe_promote(
-                env,
-                model,
+            win_rate = sum(pool_outcomes) / len(pool_outcomes) if pool_outcomes else 0.0
+            opponent_pool, promoted = maybe_promote(
                 opponent_pool,
                 train_state.params,
                 config.opponent.pool_size,
                 config.opponent.pool_win_rate_threshold,
-                config.opponent.pool_eval_games,
-                promote_key,
+                win_rate,
             )
-            print(f"pool check | win_rate {win_rate:.2f} | promoted {promoted} | pool_size {len(opponent_pool)}")
+            print(
+                f"pool check | win_rate {win_rate:.2f} (n={len(pool_outcomes)}) | "
+                f"promoted {promoted} | pool_size {len(opponent_pool)}"
+            )
 
         # Evaluation (Phase 13) goes here, gated on config.training.evaluation_frequency.
         # Not yet wired into the loop — see generals_rl/evaluate.py for the standalone version.

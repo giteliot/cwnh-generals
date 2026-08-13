@@ -34,6 +34,8 @@ class RLEnvAdapter:
         shaping_max_ratio: float = 10.0,
     ):
         self.env = env
+        # Scale for the timestep observation channel (see observation_processor).
+        self.max_timestep = float(env.truncation)
         self.terminal_win_reward = terminal_win_reward
         self.terminal_loss_reward = terminal_loss_reward
         self.terminal_draw_reward = terminal_draw_reward
@@ -53,13 +55,13 @@ class RLEnvAdapter:
         reset_with_pool() per environment so they share it (see parallel.py).
         """
         pool, init_state = self.env.reset(key)
-        observation = process_observation(self._get_obs(init_state, 0))
+        observation = process_observation(self._get_obs(init_state, 0), self.max_timestep)
         return observation, AdapterState(state=init_state), pool
 
     def reset_with_pool(self, key: jnp.ndarray, pool: GameState) -> tuple[jnp.ndarray, AdapterState]:
         """Generate a single initial state using an existing (shared) pool."""
         init_state = self.env.init_state(key)
-        observation = process_observation(self._get_obs(init_state, 0))
+        observation = process_observation(self._get_obs(init_state, 0), self.max_timestep)
         return observation, AdapterState(state=init_state)
 
     def step(
@@ -72,7 +74,9 @@ class RLEnvAdapter:
         actions = jnp.stack([action, opponent_action])
         timestep, new_state = self.env.step(adapter_state.state, actions, pool)
 
-        observation = process_observation(jax.tree.map(lambda x: x[0], timestep.observation))
+        observation = process_observation(
+            jax.tree.map(lambda x: x[0], timestep.observation), self.max_timestep
+        )
         done = timestep.terminated | timestep.truncated
         reward = shaped_reward(
             state=adapter_state.state,

@@ -40,14 +40,15 @@ def ppo_loss(
     params,
     model: ActorCritic,
     observations: jnp.ndarray,
+    valid_masks: jnp.ndarray,
     actions: jnp.ndarray,
     old_log_probs: jnp.ndarray,
     advantages: jnp.ndarray,
     returns: jnp.ndarray,
     config: PPOConfig,
 ) -> tuple[jnp.ndarray, dict]:
-    log_probs, entropy, values = jax.vmap(evaluate_action, in_axes=(None, None, 0, 0))(
-        model, params, observations, actions
+    log_probs, entropy, values = jax.vmap(evaluate_action, in_axes=(None, None, 0, 0, 0))(
+        model, params, observations, valid_masks, actions
     )
 
     ratio = jnp.exp(log_probs - old_log_probs)
@@ -72,11 +73,11 @@ def ppo_loss(
 
 
 def _update_minibatch(train_state: TrainState, batch, model: ActorCritic, config: PPOConfig) -> tuple[TrainState, dict]:
-    observations, actions, old_log_probs, advantages, returns = batch
+    observations, valid_masks, actions, old_log_probs, advantages, returns = batch
 
     grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
     (_, metrics), grads = grad_fn(
-        train_state.params, model, observations, actions, old_log_probs, advantages, returns, config
+        train_state.params, model, observations, valid_masks, actions, old_log_probs, advantages, returns, config
     )
 
     updates, new_opt_state = _optimizer(config).update(grads, train_state.opt_state, train_state.params)
@@ -89,6 +90,7 @@ def update(
     train_state: TrainState,
     model: ActorCritic,
     observations: jnp.ndarray,
+    valid_masks: jnp.ndarray,
     actions: jnp.ndarray,
     old_log_probs: jnp.ndarray,
     advantages: jnp.ndarray,
@@ -108,6 +110,7 @@ def update(
             batch_indices = jax.lax.dynamic_slice_in_dim(perm, minibatch_idx * config.minibatch_size, config.minibatch_size)
             batch = (
                 observations[batch_indices],
+                valid_masks[batch_indices],
                 actions[batch_indices],
                 old_log_probs[batch_indices],
                 advantages[batch_indices],

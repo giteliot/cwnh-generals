@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 
+from generals.core.action import compute_valid_move_mask_obs
 from generals.core.game import GameState
 from generals_rl.env_adapter import AdapterState, RLEnvAdapter
 from generals_rl.network import ActorCritic, get_value, select_action
@@ -18,6 +19,7 @@ from generals_rl.parallel import step_parallel
 
 class Rollout(NamedTuple):
     observations: jnp.ndarray
+    valid_masks: jnp.ndarray  # (H, W, 4) per step; see network.py on why this is stored
     actions: jnp.ndarray
     log_probs: jnp.ndarray
     values: jnp.ndarray
@@ -53,6 +55,7 @@ def collect_rollout(
     Returns (rollout, final_adapter_state, final_observation, final_key).
     """
     num_envs = observation.shape[0]
+    max_timestep = adapter.max_timestep
 
     def step_fn(carry, _):
         adapter_state, observation, key = carry
@@ -60,24 +63,33 @@ def collect_rollout(
         action_keys = jrandom.split(action_key, num_envs)
         opponent_keys = jrandom.split(opponent_key, num_envs)
 
-        action, log_prob, value = jax.vmap(select_action, in_axes=(None, None, 0, 0))(
-            model, params, observation, action_keys
+        # `observation` is the processed view of adapter_state.state (both come
+        # from the same post-auto-reset state), so the mask matches it.
+        own_observation = jax.vmap(lambda state: adapter._get_obs(state, 0))(adapter_state.state)
+        valid_mask = jax.vmap(compute_valid_move_mask_obs)(own_observation)
+
+        action, log_prob, value = jax.vmap(select_action, in_axes=(None, None, 0, 0, 0))(
+            model, params, observation, valid_mask, action_keys
         )
 
         opponent_observation = jax.vmap(lambda state: adapter._get_obs(state, 1))(adapter_state.state)
         opponent_action = mixed_opponent_action(
-            model, opponent_pool_params, opponent_kinds, opponent_checkpoint_idx, opponent_observation, opponent_keys
+            model, opponent_pool_params, opponent_kinds, opponent_checkpoint_idx,
+            opponent_observation, opponent_keys, max_timestep,
         )
 
         next_observation, info, done, next_adapter_state = step_parallel(
             adapter, adapter_state, action, opponent_action, pool
         )
 
-        bootstrap_obs = jax.vmap(lambda state: process_observation(adapter._get_obs(state, 0)))(info["last_state"])
+        bootstrap_obs = jax.vmap(
+            lambda state: process_observation(adapter._get_obs(state, 0), max_timestep)
+        )(info["last_state"])
         bootstrap_value = jax.vmap(get_value, in_axes=(None, None, 0))(model, params, bootstrap_obs)
 
         transition = (
             observation,
+            valid_mask,
             action,
             log_prob,
             value,

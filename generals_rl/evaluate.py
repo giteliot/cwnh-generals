@@ -7,10 +7,10 @@ from typing import NamedTuple
 import jax.random as jrandom
 
 from generals.agents.agent import Agent
+from generals.core.action import compute_valid_move_mask_obs
 from generals.core.env import GeneralsEnv
 from generals_rl.env_adapter import RLEnvAdapter
 from generals_rl.network import ActorCritic, select_greedy_action
-from generals_rl.observation_processor import process_observation
 
 
 class EvaluationResult(NamedTuple):
@@ -62,7 +62,8 @@ def evaluate(
 
         while not done:
             key, opponent_key = jrandom.split(key)
-            action = select_greedy_action(model, params, observation)
+            own_obs = adapter._get_obs(adapter_state.state, 0)
+            action = select_greedy_action(model, params, observation, compute_valid_move_mask_obs(own_obs))
             opponent_obs = adapter._get_obs(adapter_state.state, 1)
             opponent_action = opponent.act(opponent_obs, opponent_key)
             observation, info, done, adapter_state = adapter.step(adapter_state, action, opponent_action, pool)

@@ -41,7 +41,7 @@ class OpponentConfig:
     pool_checkpoint_weight: float = 0.7
     scripted_bot_weights: dict[str, float] = field(default_factory=_default_scripted_weights)
     pool_update_frequency: int = 100  # iterations between promotion checks
-    pool_eval_games: int = 20
+    pool_win_rate_window: int = 50  # rolling window of recent pool-game outcomes, from normal rollouts
     pool_win_rate_threshold: float = 0.45
 
 

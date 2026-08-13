@@ -14,6 +14,7 @@ from generals.agents.expander_agent import ExpanderAgent
 from generals.agents.harvester_agent import HarvesterAgent
 from generals.agents.hunter_agent import HunterAgent
 from generals.agents.random_agent import RandomAgent
+from generals.core.action import compute_valid_move_mask_obs
 from generals.core.observation import Observation
 from generals_rl.network import ActorCritic, select_greedy_action
 from generals_rl.observation_processor import process_observation
@@ -53,13 +54,19 @@ def _per_env_action(
     kind: jnp.ndarray,
     observation: Observation,
     key: jnp.ndarray,
+    max_timestep: float,
 ) -> jnp.ndarray:
     branches = [
         lambda o, k: _SCRIPTED_AGENTS[0].act(o, k),
         lambda o, k: _SCRIPTED_AGENTS[1].act(o, k),
         lambda o, k: _SCRIPTED_AGENTS[2].act(o, k),
         lambda o, k: _SCRIPTED_AGENTS[3].act(o, k),
-        lambda o, k: select_greedy_action(model, checkpoint_params, process_observation(o)),
+        lambda o, k: select_greedy_action(
+            model,
+            checkpoint_params,
+            process_observation(o, max_timestep),
+            compute_valid_move_mask_obs(o),
+        ),
     ]
     return jax.lax.switch(kind, branches, observation, key)
 
@@ -71,6 +78,7 @@ def mixed_opponent_action(
     checkpoint_idx: jnp.ndarray,
     observations: Observation,
     keys: jnp.ndarray,
+    max_timestep: float,
 ) -> jnp.ndarray:
     """Batched opponent action over num_envs, dispatching per env by `kinds`.
 
@@ -78,7 +86,7 @@ def mixed_opponent_action(
     pool_params_stack: param pytree with a leading (pool_size,) axis.
     """
     own_checkpoint_params = jax.tree.map(lambda x: x[checkpoint_idx], pool_params_stack)
-    return jax.vmap(_per_env_action, in_axes=(None, 0, 0, 0, 0))(
-        model, own_checkpoint_params, kinds, observations, keys
+    return jax.vmap(_per_env_action, in_axes=(None, 0, 0, 0, 0, None))(
+        model, own_checkpoint_params, kinds, observations, keys, max_timestep
     )
 

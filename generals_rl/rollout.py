@@ -25,6 +25,7 @@ class Rollout(NamedTuple):
     terminated: jnp.ndarray
     truncated: jnp.ndarray
     bootstrap_values: jnp.ndarray
+    winner: jnp.ndarray  # -1 ongoing/draw, 0 = player 0 (learner) won, 1 = opponent won
 
 
 def collect_rollout(
@@ -84,6 +85,7 @@ def collect_rollout(
             info["terminated"],
             info["truncated"],
             bootstrap_value,
+            info["game_info"].winner,
         )
         return (next_adapter_state, next_observation, key), transition
 

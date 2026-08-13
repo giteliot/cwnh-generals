@@ -3,8 +3,12 @@
 Runs config.ppo.num_envs environments in parallel via jax.vmap (Phase 9), and
 mixes self-play against a checkpoint pool with scripted bots (Phase 14).
 """
+import time
+
+import jax
 import jax.numpy as jnp
 import jax.random as jrandom
+import numpy as np
 
 from generals.core.env import GeneralsEnv
 from generals_rl import checkpoint as checkpoint_lib
@@ -13,10 +17,10 @@ from generals_rl.env_adapter import RLEnvAdapter
 from generals_rl.gae import compute_gae
 from generals_rl.network import ActorCritic
 from generals_rl.opponent_pool import create_pool, maybe_promote, stack_pool
-from generals_rl.opponents import sample_opponent_assignment
+from generals_rl.opponents import KIND_NAMES, sample_opponent_assignment
 from generals_rl.parallel import reset_parallel
 from generals_rl.ppo import PPOConfig, create_train_state, update
-from generals_rl.rollout import collect_rollout
+from generals_rl.rollout import Rollout, collect_rollout
 
 
 def _ppo_config_from(config: Config) -> PPOConfig:
@@ -29,6 +33,25 @@ def _ppo_config_from(config: Config) -> PPOConfig:
         minibatch_size=config.ppo.minibatch_size,
         max_grad_norm=config.ppo.max_grad_norm,
     )
+
+
+def _opponent_breakdown(rollout: Rollout, opponent_kinds: jnp.ndarray) -> dict[str, tuple[int, int, int]]:
+    """Win/loss/draw counts from this rollout, broken down by opponent kind."""
+    done = np.asarray(rollout.terminated | rollout.truncated)  # (T, N)
+    winner = np.asarray(rollout.winner)  # (T, N)
+    kinds = np.broadcast_to(np.asarray(opponent_kinds), done.shape)  # (T, N)
+
+    stats = {}
+    for kind_idx, name in enumerate(KIND_NAMES):
+        mask = done & (kinds == kind_idx)
+        total = int(mask.sum())
+        if total == 0:
+            continue
+        wins = int((mask & (winner == 0)).sum())
+        losses = int((mask & (winner == 1)).sum())
+        draws = total - wins - losses
+        stats[name] = (wins, losses, draws)
+    return stats
 
 
 def train(
@@ -81,6 +104,7 @@ def train(
         end_iteration = config.training.total_timesteps // steps_per_iteration
 
     for iteration in range(start_iteration, end_iteration):
+        iteration_start_time = time.time()
         key, rollout_key, update_key, opponent_assign_key, promote_key = jrandom.split(key, 5)
 
         opponent_pool_params = stack_pool(opponent_pool)
@@ -114,13 +138,24 @@ def train(
         )
 
         if iteration % config.training.log_frequency == 0:
+            # JAX dispatches asynchronously; block on the actual result before timing.
+            metrics = jax.block_until_ready(metrics)
+            elapsed = time.time() - iteration_start_time
+            steps_per_sec = steps_per_iteration / elapsed
+
             num_episodes = int(jnp.sum(rollout.terminated | rollout.truncated))
             mean_reward = float(jnp.mean(rollout.rewards))
+            breakdown = _opponent_breakdown(rollout, opponent_kinds)
+            breakdown_str = " | ".join(f"{name} {w}/{l}/{d}" for name, (w, l, d) in breakdown.items())
+
             print(
                 f"iter {iteration} | steps {iteration * steps_per_iteration} | "
+                f"{elapsed:.2f}s ({steps_per_sec:.0f} steps/s) | "
                 f"episodes {num_episodes} | mean_reward {mean_reward:.4f} | "
                 + " | ".join(f"{k} {float(v):.4f}" for k, v in metrics.items())
             )
+            if breakdown_str:
+                print(f"  W/L/D by opponent | {breakdown_str}")
 
         if checkpoint_dir is not None and (iteration + 1) % config.training.checkpoint_frequency == 0:
             checkpoint_lib.save(checkpoint_dir, iteration, train_state, key, config)
